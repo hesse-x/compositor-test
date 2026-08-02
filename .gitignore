@@ -1,0 +1,13 @@
+*.o
+*.iso
+*.swo
+*.swp
+*.swm
+*.swn
+*.bin
+tmp
+log.txt
+*.out
+*.orig
+
+build
