@@ -21,15 +21,31 @@ find_program(NINJA_EXECUTABLE  ninja  REQUIRED)
 
 # Options passed to `meson setup` for wlroots.
 # examples/tests are disabled because we compile tinywl.c ourselves.
+# 嵌套合成器：只编 x11 后端，禁掉 drm/libinput 后端，因此
+# 不依赖 libdrm / libinput / libudev（避免和系统包版本打架）。
+# wayland 后端默认无条件编入（backend/meson.build 里 subdir('wayland')），
+# 不受 backends 选项控制，所以嵌套到 Wayland 会话也支持。
+# gbm allocator 保留（嵌套后端靠它分配 buffer）；libgbm 走 vendor 的 gbm.pc。
 set(WLROOTS_MESON_OPTIONS
 	-Dexamples=false
 	-Dxwayland=disabled
+	-Dbackends=x11
 	CACHE STRING "Extra options for wlroots meson setup")
 
 # Configure wlroots (runs once; delete the wlroots build dir to reconfigure).
+# 系统 wayland 1.22 < wlroots 0.18 要求的 1.23：把 wayland 1.23 源码放进
+# wlroots 源码树的 subprojects/wayland（git submodule），meson 的 fallback
+# 机制会自动发现并把它作为子项目源码编译，不碰系统包。
+#
+# libgbm 同理装不上（版本坑），但它在 mesa 里没法独立源码编译。这里用
+# vendor 的 gbm.h + 一个 gbm.pc 指向系统 libgbm.so.1，让 wlroots 的
+# dependency('gbm') 满足。通过 PKG_CONFIG_PATH 暴露给 meson。
+set(GBM_PC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gbm)
 add_custom_command(
 	OUTPUT ${WLROOTS_BUILD}/build.ninja
-	COMMAND ${MESON_EXECUTABLE} setup ${WLROOTS_BUILD} ${WLROOTS_SRC}
+	COMMAND ${CMAKE_COMMAND} -E env
+	        PKG_CONFIG_PATH=${GBM_PC_DIR}
+	        ${MESON_EXECUTABLE} setup ${WLROOTS_BUILD} ${WLROOTS_SRC}
 	        ${WLROOTS_MESON_OPTIONS}
 	COMMENT "Configuring wlroots with Meson"
 	VERBATIM
@@ -70,27 +86,58 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(WAYLAND_SERVER REQUIRED IMPORTED_TARGET wayland-server)
 pkg_check_modules(XKBCOMMON      REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(PIXMAN         REQUIRED IMPORTED_TARGET pixman-1)
-pkg_check_modules(CAIRO          REQUIRED IMPORTED_TARGET cairo)
-pkg_check_modules(LIBDRM         REQUIRED IMPORTED_TARGET libdrm)
-pkg_check_modules(LIBPNG         REQUIRED IMPORTED_TARGET libpng)
+
+# tinywl 只用到 drm_fourcc.h 里的 DRM_FORMAT_* 宏（纯头文件，无需链接 libdrm）。
+# 系统 libdrm-dev 因运行库版本冲突装不上，但 libdrm2 运行库自带
+# /usr/include/drm/drm_fourcc.h，直接用它即可。
+if(NOT EXISTS /usr/include/drm/drm_fourcc.h)
+	message(FATAL_ERROR "找不到 /usr/include/drm/drm_fourcc.h（需 libdrm2 运行库）")
+endif()
+
+# libpng：系统 libpng-dev 因运行库版本冲突装不上，改为源码子项目本地编译。
+# 完全不碰系统包；产物在 build/libpng/，头文件和库都来自这里。
+set(PNG_SHARED ON CACHE BOOL "" FORCE)
+set(PNG_STATIC OFF CACHE BOOL "" FORCE)
+set(PNG_TESTS OFF CACHE BOOL "" FORCE)
+set(PNG_TOOLS OFF CACHE BOOL "" FORCE)
+set(PNG_EXECUTABLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/libpng ${CMAKE_CURRENT_BINARY_DIR}/libpng)
 
 # ---------------------------------------------------------------------------
 # tinywl（仓库内的定制版：在官方 tinywl 基础上加了桌面壁纸支持）
 # ---------------------------------------------------------------------------
 add_executable(tinywl ${CMAKE_CURRENT_SOURCE_DIR}/tinywl.c)
+target_include_directories(tinywl PRIVATE
+	/usr/include/drm
+	${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpng
+	${CMAKE_CURRENT_BINARY_DIR}/libpng)
 target_link_libraries(tinywl PRIVATE
 	wlroots
 	PkgConfig::WAYLAND_SERVER
 	PkgConfig::XKBCOMMON
 	PkgConfig::PIXMAN
-	PkgConfig::LIBDRM
-	PkgConfig::LIBPNG
+	png_shared
 )
-# 让 tinywl 在构建目录里直接运行时能找到 libwlroots-0.18.so
-set_target_properties(tinywl PROPERTIES BUILD_RPATH ${WLROOTS_BUILD})
+# 让 tinywl 在构建目录里直接运行时能找到 libwlroots-0.18.so 和 libpng16.so
+set_target_properties(tinywl PROPERTIES
+	BUILD_RPATH "${WLROOTS_BUILD};${CMAKE_CURRENT_BINARY_DIR}/libpng")
 
 # ---------------------------------------------------------------------------
-# gles-term：GLES 渲染的最小终端窗口（mac 风标题栏 + 半透明背景）
+# freetype：源码子项目本地编译，给 gles-term 做字形光栅化。
+# 禁掉 harfbuzz/brotli/bzip2 避免引入新的系统包依赖；zlib 用系统的，
+# PNG 复用上面本地编的 png target。
+# ---------------------------------------------------------------------------
+set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BROTLI  ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_BZIP2   ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_HVF     ON CACHE BOOL "" FORCE)
+set(FT_DISABLE_PNG     ON CACHE BOOL "" FORCE)
+set(FT_REQUIRE_ZLIB    ON  CACHE BOOL "" FORCE)
+add_subdirectory(third_party/freetype ${CMAKE_CURRENT_BINARY_DIR}/freetype)
+
+# ---------------------------------------------------------------------------
+# gles-term：GLES2 渲染的最小终端窗口（mac 风标题栏 + 半透明背景）。
+# 渲染全部走 GLES（freetype 光栅化字形图集），不依赖 cairo。
 # ---------------------------------------------------------------------------
 find_program(WAYLAND_SCANNER_EXECUTABLE wayland-scanner REQUIRED)
 pkg_check_modules(WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
@@ -129,7 +176,10 @@ target_link_libraries(gles-term PRIVATE
 	PkgConfig::EGL
 	PkgConfig::GLESV2
 	PkgConfig::XKBCOMMON
-	PkgConfig::CAIRO
+	freetype
 	util  # forkpty
 	m
 )
+# 运行时找得到本地编的 libfreetype.so
+set_target_properties(gles-term PROPERTIES
+	BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR}/freetype)

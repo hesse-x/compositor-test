@@ -2,10 +2,10 @@
 //   · forkpty() 起 $SHELL：键盘输入写进 PTY，shell 输出读回来解析
 //   · 内置最小 VT 模拟器：UTF-8、CSI（光标/清屏/滚动/插入删除）、
 //     SGR 16/256/真彩色、备用屏幕（less/htop 可用）、OSC 标题
-//   · 文字/标题栏由 cairo 在 CPU 光栅化成位图，上传为 GL 纹理
-//   · GPU (GLES2 + EGL) 只负责把纹理贴上屏幕（eglSwapBuffers 自动提交）
+//   · 文字用 freetype 光栅化成字形图集纹理，GLES2 直接绘制
+//     （不依赖 cairo：矩形/圆角/圆/字符全在 GPU 上画）
 //   · mac 风标题栏：红绿灯按钮（纯装饰）+ 居中标题（跟随 OSC 0/2）
-//   · 圆角 + 半透明背景（靠像素的 alpha 通道，合成器负责混合）
+//   · 圆角 + 半透明背景（fragment shader 里按 alpha 通道裁剪，合成器负责混合）
 #define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdint.h>
@@ -29,7 +29,8 @@
 #include <GLES2/gl2.h>
 #include <GLES2/gl2ext.h>
 #include <xkbcommon/xkbcommon.h>
-#include <cairo.h>
+#include <ft2build.h>
+#include FT_FREETYPE_H
 
 #include "xdg-shell-client-protocol.h"
 
@@ -573,7 +574,7 @@ struct app {
 	struct wl_keyboard *keyboard;
 	struct wl_pointer *pointer;
 
-	// 指针状态（surface 局部坐标，与 cairo 坐标一致）
+	// 指针状态（surface 局部坐标）
 	double ptr_x, ptr_y;
 	bool ptr_hover_buttons;   // 悬停在红绿灯区域（显示 ×/−/＋ 图标）
 
@@ -591,10 +592,7 @@ struct app {
 	EGLDisplay egl_dpy;
 	EGLContext egl_ctx;
 	EGLSurface egl_surf;
-	GLuint gl_prog;
-	GLuint gl_tex;
 	bool gl_ready;
-	bool gl_has_bgra;
 
 	// 字体度量
 	int cell_w, cell_h;
@@ -624,226 +622,221 @@ static void grid_dims(int *cols, int *rows) {
 	*rows = CLAMP(*rows, 3, MAX_ROWS);
 }
 
+// ---------------------------------------------------------------------------
+// freetype 字体度量 + 字形图集
+// ---------------------------------------------------------------------------
+// 字形图集：把用得到的字符一次性光栅化到一张大纹理上，绘制时按码点查
+// 坐标，用纹理四边形画字。终端字符集稳定，一次构建即可。
+#define ATLAS_W 1024
+#define ATLAS_H 1024
+#define GLYPH_CACHE_SIZE 4096
+#define ATLAS_PAD 1
+
+struct glyph {
+	uint32_t cp;       // 码点
+	int atlas_x, atlas_y;  // 在图集中的像素位置
+	int w, h;          // 字形位图尺寸
+	int bearing_x, bearing_y;  // 笔画原点到字形左上角的偏移
+	int advance;       // 该字形的水平推进（像素）
+};
+
+static FT_Library ft_lib;
+static FT_Face ft_face;
+static GLuint atlas_tex;
+// 开放寻址哈希表，避免 Unicode 码点受一个很小的直接索引数组限制。
+static struct glyph atlas_glyphs[GLYPH_CACHE_SIZE];
+static int atlas_count;
+static int atlas_cursor_x = ATLAS_PAD;
+static int atlas_cursor_y = ATLAS_PAD;
+static int atlas_row_h;
+
+static struct glyph *glyph_lookup(uint32_t cp) {
+	if (cp == 0)
+		return NULL;
+	size_t slot = (cp * 2654435761u) & (GLYPH_CACHE_SIZE - 1);
+	for (size_t i = 0; i < GLYPH_CACHE_SIZE; i++) {
+		struct glyph *g = &atlas_glyphs[slot];
+		if (g->cp == cp)
+			return g;
+		if (g->cp == 0)
+			return NULL;
+		slot = (slot + 1) & (GLYPH_CACHE_SIZE - 1);
+	}
+	return NULL;
+}
+
+static struct glyph *glyph_insert(struct glyph glyph) {
+	size_t slot = (glyph.cp * 2654435761u) & (GLYPH_CACHE_SIZE - 1);
+	for (size_t i = 0; i < GLYPH_CACHE_SIZE; i++) {
+		struct glyph *g = &atlas_glyphs[slot];
+		if (g->cp == 0 || g->cp == glyph.cp) {
+			if (g->cp == 0)
+				atlas_count++;
+			*g = glyph;
+			return g;
+		}
+		slot = (slot + 1) & (GLYPH_CACHE_SIZE - 1);
+	}
+	return NULL;
+}
+
+// 把一个字形渲染进图集，记录其位置和度量
+static struct glyph *atlas_add(FT_Face face, uint32_t cp) {
+	struct glyph *cached = glyph_lookup(cp);
+	if (cached)
+		return cached;
+	if (FT_Load_Char(face, cp, FT_LOAD_RENDER) || !face->glyph->bitmap.buffer)
+		return NULL;
+	struct glyph g = {
+		.cp = cp,
+		.w = (int)face->glyph->bitmap.width,
+		.h = (int)face->glyph->bitmap.rows,
+		.bearing_x = face->glyph->bitmap_left,
+		.bearing_y = face->glyph->bitmap_top,
+		.advance = (int)(face->glyph->advance.x >> 6),
+	};
+	if (atlas_cursor_x + g.w + ATLAS_PAD > ATLAS_W) {
+		atlas_cursor_x = ATLAS_PAD;
+		atlas_cursor_y += atlas_row_h + ATLAS_PAD;
+		atlas_row_h = 0;
+	}
+	if (atlas_cursor_y + g.h + ATLAS_PAD > ATLAS_H)
+		return NULL;
+	if (g.h > atlas_row_h)
+		atlas_row_h = g.h;
+	g.atlas_x = atlas_cursor_x;
+	g.atlas_y = atlas_cursor_y;
+	atlas_cursor_x += g.w + ATLAS_PAD;
+
+	// 把单色位图画进图集的 (g.atlas_x, g.atlas_y) 位置。
+	// freetype 输出单通道灰度位图，扩展成 RGBA（R=G=B=0, A=亮度）上传，
+	// 和 GL_RGBA 纹理格式匹配。
+	glBindTexture(GL_TEXTURE_2D, atlas_tex);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	size_t npix = (size_t)g.w * g.h;
+	uint8_t *rgba = calloc(npix, 4);
+	if (!rgba)
+		return NULL;
+	FT_Bitmap *bitmap = &face->glyph->bitmap;
+	for (int y = 0; y < g.h; y++) {
+		const uint8_t *src = bitmap->pitch >= 0
+				? bitmap->buffer + (size_t)y * bitmap->pitch
+				: bitmap->buffer + (size_t)(g.h - 1 - y) * (size_t)-bitmap->pitch;
+		for (int x = 0; x < g.w; x++) {
+			uint8_t coverage;
+			if (bitmap->pixel_mode == FT_PIXEL_MODE_MONO)
+				coverage = (src[x / 8] & (0x80 >> (x % 8))) ? 255 : 0;
+			else
+				coverage = src[x];
+			rgba[((size_t)y * g.w + x) * 4 + 3] = coverage;
+		}
+	}
+	glTexSubImage2D(GL_TEXTURE_2D, 0, g.atlas_x, g.atlas_y, g.w, g.h,
+			GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+	free(rgba);
+
+	return glyph_insert(g);
+}
+
+// 找一个可用的 monospace 字体文件。优先 fontconfig 的结果，再退到常见路径。
+static const char *find_font(void) {
+	static char path[512];
+	FILE *fp = popen("fc-match -f '%{file}' monospace 2>/dev/null", "r");
+	if (fp) {
+		if (fgets(path, sizeof(path), fp)) {
+			pclose(fp);
+			if (path[0] == '/' || path[0])
+				return path;
+		} else {
+			pclose(fp);
+		}
+	}
+	static const char *fallbacks[] = {
+		"/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+		"/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
+		"/usr/share/fonts/truetype/ubuntu/UbuntuMono-R.ttf",
+		NULL,
+	};
+	for (int i = 0; fallbacks[i]; i++)
+		if (access(fallbacks[i], R_OK) == 0)
+			return fallbacks[i];
+	return NULL;
+}
+
 static void measure_font(void) {
-	cairo_surface_t *s = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-	cairo_t *cr = cairo_create(s);
-	cairo_select_font_face(cr, "monospace",
-			CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-	cairo_set_font_size(cr, FONT_SIZE);
-	cairo_text_extents_t te;
-	cairo_text_extents(cr, "M", &te);
-	app.cell_w = (int)ceil(te.width);
-	cairo_font_extents_t fe;
-	cairo_font_extents(cr, &fe);
-	app.cell_h = (int)ceil(fe.height);
-	app.ascent = fe.ascent;
-	cairo_destroy(cr);
-	cairo_surface_destroy(s);
+	if (FT_Init_FreeType(&ft_lib)) {
+		fprintf(stderr, "freetype 初始化失败\n");
+		exit(1);
+	}
+	const char *font = find_font();
+	if (!font) {
+		fprintf(stderr, "找不到 monospace 字体（apt-get install fonts-dejavu）\n");
+		exit(1);
+	}
+	if (FT_New_Face(ft_lib, font, 0, &ft_face)) {
+		fprintf(stderr, "无法加载字体 %s\n", font);
+		exit(1);
+	}
+	FT_Set_Pixel_Sizes(ft_face, 0, (int)FONT_SIZE);
+
+	// 用 'M' 量单元格宽高（等宽字体所有字符 advance 相同）
+	FT_Load_Char(ft_face, 'M', FT_LOAD_DEFAULT);
+	app.cell_w = (int)(ft_face->glyph->advance.x >> 6);
+	FT_Load_Char(ft_face, 'M', FT_LOAD_RENDER);
+	int ascent = ft_face->size->metrics.ascender >> 6;
+	int descent = ft_face->size->metrics.descender >> 6;
+	app.cell_h = ascent - descent;
+	app.ascent = ascent;
+
+	// 字体度量不依赖 GLES；图集必须等 EGL context current 后再创建。
+}
+
+static void atlas_init(void) {
+	// 建一张 RGBA 图集纹理，预光栅化 ASCII + 常见标点。
+	// 用 RGBA 而非 GL_ALPHA：现代 GLES 驱动对单通道格式支持参差，RGBA 最稳。
+	glGenTextures(1, &atlas_tex);
+	glBindTexture(GL_TEXTURE_2D, atlas_tex);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	uint8_t *empty = calloc((size_t)ATLAS_W * ATLAS_H, 4);
+	if (!empty) {
+		fprintf(stderr, "无法分配字形图集\n");
+		exit(1);
+	}
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_W, ATLAS_H, 0,
+			GL_RGBA, GL_UNSIGNED_BYTE, empty);
+	free(empty);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	for (uint32_t c = 0x20; c < 0x7f; c++)
+		atlas_add(ft_face, c);
+	// 常见非 ASCII：框线/阴影字符（htop、对话框边框用）
+	static const uint32_t extra[] = {
+		0x2500, 0x2501, 0x2502, 0x2503, 0x250c, 0x250f, 0x2510, 0x2513,
+		0x2514, 0x2517, 0x2518, 0x251b, 0x251c, 0x251f, 0x2523, 0x252b,
+		0x2533, 0x253b, 0x254b, 0x2580, 0x2584, 0x2588, 0x258c, 0x2590,
+		0x2591, 0x2592, 0x2593, 0
+	};
+	for (int i = 0; extra[i]; i++)
+		atlas_add(ft_face, extra[i]);
+}
+
+// 取码点对应的字形；不在图集里就按需补一个（终端可能收到任意 Unicode）
+static struct glyph *get_glyph(uint32_t cp) {
+	struct glyph *g = glyph_lookup(cp);
+	return g ? g : atlas_add(ft_face, cp);
 }
 
 // ---------------------------------------------------------------------------
-// cairo 绘制整窗内容（标题栏 + 红绿灯 + 终端网格 + 光标）到一张 CPU 位图
+// GLES 渲染：矩形着色器（纯色 + 圆角裁剪）+ 字形着色器（采样图集）
 // ---------------------------------------------------------------------------
-static void rounded_rect_path(cairo_t *cr, double x, double y,
-		double w, double h, double r) {
-	cairo_new_sub_path(cr);
-	cairo_arc(cr, x + w - r, y + r,     r, -M_PI_2, 0);
-	cairo_arc(cr, x + w - r, y + h - r, r, 0, M_PI_2);
-	cairo_arc(cr, x + r,     y + h - r, r, M_PI_2, M_PI);
-	cairo_arc(cr, x + r,     y + r,     r, M_PI, 3 * M_PI_2);
-	cairo_close_path(cr);
-}
+// 坐标系：用像素坐标 + 正交投影，避免每个图元都算 NDC。窗口左上角为原点，
+// y 向下（和终端网格、wayland 表面坐标一致）。
+static GLuint rect_prog, text_prog;
+static GLint rect_proj_loc, text_proj_loc, atlas_loc;
+static GLuint vbo;
 
-static void draw_circle(cairo_t *cr, double cx, double cy, double r,
-		double red, double green, double blue) {
-	cairo_arc(cr, cx, cy, r, 0, 2 * M_PI);
-	cairo_set_source_rgb(cr, red, green, blue);
-	cairo_fill(cr);
-}
-
-static void set_fg_color(cairo_t *cr, uint32_t rgb, double alpha) {
-	if (rgb == COLOR_DEFAULT)
-		cairo_set_source_rgba(cr, 0.85, 0.9, 0.85, alpha);
-	else
-		cairo_set_source_rgba(cr, ((rgb >> 16) & 0xFF) / 255.0,
-				((rgb >> 8) & 0xFF) / 255.0, (rgb & 0xFF) / 255.0, alpha);
-}
-
-static void set_bg_color(cairo_t *cr, uint32_t rgb) {
-	if (rgb == COLOR_DEFAULT)
-		cairo_set_source_rgb(cr, 0.16, 0.16, 0.20);  // 反色时当"纸"用
-	else
-		cairo_set_source_rgb(cr, ((rgb >> 16) & 0xFF) / 255.0,
-				((rgb >> 8) & 0xFF) / 255.0, (rgb & 0xFF) / 255.0);
-}
-
-static size_t utf8_encode(uint32_t cp, char *out) {
-	if (cp < 0x80) {
-		out[0] = (char)cp;
-		return 1;
-	} else if (cp < 0x800) {
-		out[0] = 0xC0 | (cp >> 6);
-		out[1] = 0x80 | (cp & 0x3F);
-		return 2;
-	} else if (cp < 0x10000) {
-		out[0] = 0xE0 | (cp >> 12);
-		out[1] = 0x80 | ((cp >> 6) & 0x3F);
-		out[2] = 0x80 | (cp & 0x3F);
-		return 3;
-	}
-	out[0] = 0xF0 | (cp >> 18);
-	out[1] = 0x80 | ((cp >> 12) & 0x3F);
-	out[2] = 0x80 | ((cp >> 6) & 0x3F);
-	out[3] = 0x80 | (cp & 0x3F);
-	return 4;
-}
-
-// 画一个单元格的字符（光标反显用）
-static void draw_glyph(cairo_t *cr, uint32_t cp, double x, double baseline) {
-	char buf[8];
-	size_t n = utf8_encode(cp ? cp : ' ', buf);
-	buf[n] = '\0';
-	cairo_move_to(cr, x, baseline);
-	cairo_show_text(cr, buf);
-}
-
-static void draw_grid(cairo_t *cr) {
-	cairo_select_font_face(cr, "monospace",
-			CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-	cairo_set_font_size(cr, FONT_SIZE);
-
-	struct cell *g = cur_grid();
-	for (int y = 0; y < term.rows; y++) {
-		double baseline = TITLEBAR_H + TERM_PAD + app.ascent + y * app.cell_h;
-		double row_y = TITLEBAR_H + TERM_PAD + y * app.cell_h;
-		int x = 0;
-		while (x < term.cols) {
-			// 把连续同色的单元格攒成一串一次画，比逐字画快很多
-			uint32_t fg = g[y * term.cols + x].fg;
-			uint32_t bg = g[y * term.cols + x].bg;
-			uint8_t fl = g[y * term.cols + x].flags;
-			if (fl & CELL_INVERSE) {
-				uint32_t t = fg;
-				fg = (bg == COLOR_DEFAULT) ? 0x1a1a24 : bg;
-				bg = (t == COLOR_DEFAULT) ? 0xd9e6d9 : t;
-			}
-			int x0 = x;
-			char run[MAX_COLS * 4 + 1];
-			size_t runlen = 0;
-			while (x < term.cols) {
-				struct cell *c = &g[y * term.cols + x];
-				uint32_t cf = c->fg, cb = c->bg;
-				if (c->flags & CELL_INVERSE) {
-					uint32_t t = cf;
-					cf = (cb == COLOR_DEFAULT) ? 0x1a1a24 : cb;
-					cb = (t == COLOR_DEFAULT) ? 0xd9e6d9 : t;
-				}
-				if (cf != fg || cb != bg)
-					break;
-				runlen += utf8_encode(c->cp ? c->cp : ' ', run + runlen);
-				x++;
-			}
-			run[runlen] = '\0';
-			double px = TERM_PAD + x0 * app.cell_w;
-			double pw = (x - x0) * app.cell_w;
-			if (bg != COLOR_DEFAULT) {
-				cairo_rectangle(cr, px, row_y, pw, app.cell_h);
-				set_bg_color(cr, bg);
-				cairo_fill(cr);
-			}
-			set_fg_color(cr, fg, 1.0);
-			cairo_move_to(cr, px, baseline);
-			cairo_show_text(cr, run);
-		}
-	}
-
-	// 光标方块
-	if (term.cursor_visible) {
-		double px = TERM_PAD + term.cx * app.cell_w;
-		double py = TITLEBAR_H + TERM_PAD + term.cy * app.cell_h;
-		cairo_rectangle(cr, px, py, app.cell_w, app.cell_h);
-		cairo_set_source_rgba(cr, 0.85, 0.9, 0.85, 0.85);
-		cairo_fill(cr);
-		struct cell *c = cell_at(term.cx, term.cy);
-		if (c->cp && c->cp != ' ') {
-			cairo_set_source_rgb(cr, 0.09, 0.09, 0.12);
-			draw_glyph(cr, c->cp, px,
-					TITLEBAR_H + TERM_PAD + app.ascent + term.cy * app.cell_h);
-		}
-	}
-}
-
-static void rasterize(uint32_t *pixels, int w, int h) {
-	cairo_surface_t *cs = cairo_image_surface_create_for_data(
-			(uint8_t *)pixels, CAIRO_FORMAT_ARGB32, w, h, w * 4);
-	cairo_t *cr = cairo_create(cs);
-
-	// 全透明底（圆角外的区域靠它露出后面的东西）
-	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
-	cairo_set_source_rgba(cr, 0, 0, 0, 0);
-	cairo_paint(cr);
-	// 后续绘制必须回到 OVER（叠加），否则每层都会整体替换掉上一层
-	cairo_set_operator(cr, CAIRO_OPERATOR_OVER);
-
-	// 圆角矩形裁剪
-	rounded_rect_path(cr, 0, 0, w, h, CORNER_RADIUS);
-	cairo_clip(cr);
-
-	// 窗口主体：半透明深色（透出后面的桌面壁纸）
-	cairo_set_source_rgba(cr, 0.09, 0.09, 0.12, 0.82);
-	cairo_paint(cr);
-
-	// 标题栏：略亮、略不透明
-	cairo_rectangle(cr, 0, 0, w, TITLEBAR_H);
-	cairo_set_source_rgba(cr, 0.20, 0.20, 0.23, 0.95);
-	cairo_fill(cr);
-	// 标题栏下沿分隔线
-	cairo_rectangle(cr, 0, TITLEBAR_H - 1, w, 1);
-	cairo_set_source_rgba(cr, 0, 0, 0, 0.4);
-	cairo_fill(cr);
-
-	// 红绿灯按钮（mac 顺序：红=关闭 黄=最小化 绿=最大化）
-	double cy = TITLEBAR_H / 2, r = 6;
-	static const double btn_x[3] = { 20, 40, 60 };
-	draw_circle(cr, btn_x[0], cy, r, 1.000, 0.373, 0.341);  // #FF5F57
-	draw_circle(cr, btn_x[1], cy, r, 0.996, 0.737, 0.180);  // #FEBC2E
-	draw_circle(cr, btn_x[2], cy, r, 0.157, 0.784, 0.251);  // #28C840
-
-	// 悬停时显示 ×/−/＋ 图标（mac 行为：悬停任意一个，三个都显示）
-	if (app.ptr_hover_buttons) {
-		static const char *glyphs[3] = { "×", "−", "+" };
-		cairo_select_font_face(cr, "sans",
-				CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-		cairo_set_font_size(cr, 9);
-		cairo_set_source_rgba(cr, 0, 0, 0, 0.55);
-		for (int i = 0; i < 3; i++) {
-			cairo_text_extents_t ge;
-			cairo_text_extents(cr, glyphs[i], &ge);
-			cairo_move_to(cr, btn_x[i] - ge.width / 2 - ge.x_bearing,
-					cy - ge.height / 2 - ge.y_bearing);
-			cairo_show_text(cr, glyphs[i]);
-		}
-	}
-
-	// 居中标题（默认 gles-term；shell 通过 OSC 0/2 会改成当前命令/目录）
-	cairo_select_font_face(cr, "sans",
-			CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_BOLD);
-	cairo_set_font_size(cr, 13);
-	cairo_text_extents_t ext;
-	cairo_text_extents(cr, app.title, &ext);
-	cairo_move_to(cr, (w - ext.width) / 2, cy + ext.height / 2 - 1);
-	cairo_set_source_rgba(cr, 1, 1, 1, 0.75);
-	cairo_show_text(cr, app.title);
-
-	draw_grid(cr);
-
-	cairo_destroy(cr);
-	cairo_surface_destroy(cs);
-}
-
-// ---------------------------------------------------------------------------
-// GLES 初始化与绘制
-// ---------------------------------------------------------------------------
 static GLuint compile_shader(GLenum type, const char *src) {
 	GLuint shader = glCreateShader(type);
 	glShaderSource(shader, 1, &src, NULL);
@@ -860,8 +853,6 @@ static GLuint compile_shader(GLenum type, const char *src) {
 }
 
 static void gl_init(void) {
-	// EGL_PLATFORM_WAYLAND_EXT 与 EGL_PLATFORM_WAYLAND 同值（0x31D8），
-	// 老 EGL 头文件只有前者
 	app.egl_dpy = eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_EXT, app.display, NULL);
 	if (app.egl_dpy == EGL_NO_DISPLAY || !eglInitialize(app.egl_dpy, NULL, NULL)) {
 		fprintf(stderr, "eglInitialize 失败\n");
@@ -869,7 +860,6 @@ static void gl_init(void) {
 	}
 	eglBindAPI(EGL_OPENGL_ES_API);
 
-	// 必须带 alpha 通道，半透明才能生效
 	EGLint config_attrs[] = {
 		EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
@@ -887,38 +877,176 @@ static void gl_init(void) {
 	app.egl_window = wl_egl_window_create(app.surface, app.width, app.height);
 	app.egl_surf = eglCreateWindowSurface(app.egl_dpy, config, app.egl_window, NULL);
 	eglMakeCurrent(app.egl_dpy, app.egl_surf, app.egl_surf, app.egl_ctx);
+	atlas_init();
 
-	// 纹理着色器：全屏四边形贴一张图
-	static const char *vs_src =
-		"attribute vec2 pos;\n"
-		"attribute vec2 tex;\n"
-		"varying vec2 v_tex;\n"
-		"void main() { v_tex = tex; gl_Position = vec4(pos, 0.0, 1.0); }\n";
-	static const char *fs_src =
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);  // 预乘 alpha 混合
+
+	// 矩形着色器：传入像素坐标顶点，fragment 里对到圆角距离做平滑裁剪。
+	// u_color 是预乘后的 RGBA。圆角通过 signed-distance-field 算 alpha：取到
+	// 矩形中心框的距离，减去圆角半径，负值在内部。对边缘做 fwidth 抗锯齿。
+	// （不用 gl_VertexID：GLES2/GLSL ES 1.00 不支持，改用 VBO 传顶点。）
+	static const char *rect_vs =
+		"attribute vec2 a_pos;\n"     // 矩形四角的像素坐标
+		"uniform mat4 u_proj;\n"
+		"varying vec2 v_pos;\n"
+		"void main() {\n"
+		"  v_pos = a_pos;\n"
+		"  gl_Position = u_proj * vec4(a_pos, 0.0, 1.0);\n"
+		"}\n";
+	static const char *rect_fs =
+		"#extension GL_OES_standard_derivatives : enable\n"  // fwidth 在 GLSL ES 1.00 需显式启用
 		"precision mediump float;\n"
-		"varying vec2 v_tex;\n"
-		"uniform sampler2D image;\n"
-		"void main() { gl_FragColor = texture2D(image, v_tex); }\n";
-	app.gl_prog = glCreateProgram();
-	glAttachShader(app.gl_prog, compile_shader(GL_VERTEX_SHADER, vs_src));
-	glAttachShader(app.gl_prog, compile_shader(GL_FRAGMENT_SHADER, fs_src));
-	glBindAttribLocation(app.gl_prog, 0, "pos");
-	glBindAttribLocation(app.gl_prog, 1, "tex");
-	glLinkProgram(app.gl_prog);
-	glUseProgram(app.gl_prog);
+		"uniform vec4 u_color;\n"     // 预乘 RGBA
+		"uniform vec4 u_rect;\n"      // (x, y, w, h)
+		"uniform float u_radius;\n"
+		"varying vec2 v_pos;\n"
+		"void main() {\n"
+		"  // 到矩形中心框的距离，r 为圆角半径\n"
+		"  vec2 center = u_rect.xy + u_rect.zw * 0.5;\n"
+		"  vec2 d = max(abs(v_pos - center) - (u_rect.zw * 0.5 - vec2(u_radius)), 0.0);\n"
+		"  float dist = length(d) - u_radius;\n"
+		"  float aa = fwidth(dist);\n"
+		"  float a = clamp(0.5 - dist / aa, 0.0, 1.0);\n"
+		"  gl_FragColor = u_color * a;\n"
+		"}\n";
+	rect_prog = glCreateProgram();
+	glAttachShader(rect_prog, compile_shader(GL_VERTEX_SHADER, rect_vs));
+	glAttachShader(rect_prog, compile_shader(GL_FRAGMENT_SHADER, rect_fs));
+	glBindAttribLocation(rect_prog, 0, "a_pos");
+	glLinkProgram(rect_prog);
+	rect_proj_loc = glGetUniformLocation(rect_prog, "u_proj");
 
-	glGenTextures(1, &app.gl_tex);
-	glBindTexture(GL_TEXTURE_2D, app.gl_tex);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	// 字形着色器：四边形覆盖字形位图区域，采样图集纹理，按 u_color 染色。
+	// 图集把 FreeType 灰度覆盖率存在 RGBA 纹理的 alpha 通道。
+	static const char *text_vs =
+		"attribute vec2 a_pos;\n"     // 窗口像素坐标
+		"attribute vec2 a_uv;\n"      // 图集纹理坐标（已归一化）
+		"uniform mat4 u_proj;\n"
+		"varying vec2 v_uv;\n"
+		"void main() {\n"
+		"  v_uv = a_uv;\n"
+		"  gl_Position = u_proj * vec4(a_pos, 0.0, 1.0);\n"
+		"}\n";
+	static const char *text_fs =
+		"precision mediump float;\n"
+		"varying vec2 v_uv;\n"
+		"uniform sampler2D u_atlas;\n"
+		"uniform vec4 u_color;\n"     // 预乘 RGBA
+		"void main() {\n"
+		"  float a = texture2D(u_atlas, v_uv).a;\n"
+		"  gl_FragColor = u_color * a;\n"
+		"}\n";
+	text_prog = glCreateProgram();
+	glAttachShader(text_prog, compile_shader(GL_VERTEX_SHADER, text_vs));
+	glAttachShader(text_prog, compile_shader(GL_FRAGMENT_SHADER, text_fs));
+	glBindAttribLocation(text_prog, 0, "a_pos");
+	glBindAttribLocation(text_prog, 1, "a_uv");
+	glLinkProgram(text_prog);
+	text_proj_loc = glGetUniformLocation(text_prog, "u_proj");
+	atlas_loc = glGetUniformLocation(text_prog, "u_atlas");
 
-	// cairo 输出在小端机器上是 BGRA 内存序，有扩展就不用自己换位
-	const char *exts = (const char *)glGetString(GL_EXTENSIONS);
-	app.gl_has_bgra = exts && strstr(exts, "GL_EXT_texture_format_BGRA8888");
-
+	glGenBuffers(1, &vbo);
 	app.gl_ready = true;
+}
+
+// 4x4 矩阵存成 16 个 float（列主序，和 GL 一致）
+typedef struct { float m[16]; } mat4;
+
+static mat4 ortho(float l, float r, float b, float t, float n, float f) {
+	mat4 m = {0};
+	m.m[0] = 2.0f / (r - l);
+	m.m[5] = 2.0f / (t - b);
+	m.m[10] = -2.0f / (f - n);
+	m.m[12] = -(r + l) / (r - l);
+	m.m[13] = -(t + b) / (t - b);
+	m.m[14] = -(f + n) / (f - n);
+	m.m[15] = 1.0f;
+	return m;
+}
+
+// 把 0xRRGGBB + alpha 转成预乘 RGBA 归一化 float
+static void color_premul(uint32_t rgb, float alpha, float out[4]) {
+	float r = ((rgb >> 16) & 0xFF) / 255.0f;
+	float g = ((rgb >> 8) & 0xFF) / 255.0f;
+	float b = (rgb & 0xFF) / 255.0f;
+	out[0] = r * alpha;
+	out[1] = g * alpha;
+	out[2] = b * alpha;
+	out[3] = alpha;
+}
+
+// 画一个圆角矩形（预乘颜色）。r=0 即直角。
+static void draw_rect(mat4 proj, float x, float y, float w, float h,
+		float r, const float color[4]) {
+	// 四个顶点的三角形带（与 v_pos attribute 对应）。GLES2 不支持 gl_VertexID。
+	float verts[4][2] = {
+		{x,     y},
+		{x + w, y},
+		{x,     y + h},
+		{x + w, y + h},
+	};
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void *)0);
+
+	glUseProgram(rect_prog);
+	glUniformMatrix4fv(rect_proj_loc, 1, GL_FALSE, proj.m);
+	glUniform4f(glGetUniformLocation(rect_prog, "u_rect"), x, y, w, h);
+	glUniform1f(glGetUniformLocation(rect_prog, "u_radius"), r);
+	glUniform4f(glGetUniformLocation(rect_prog, "u_color"), color[0], color[1], color[2], color[3]);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	glDisableVertexAttribArray(0);
+}
+
+// 画一个实心圆（用圆角半径 = r 的正方形近似）
+static void draw_circle(mat4 proj, float cx, float cy, float r,
+		const float color[4]) {
+	draw_rect(proj, cx - r, cy - r, 2 * r, 2 * r, r, color);
+}
+
+// 画一个字符（窗口像素坐标 (x, baseline)），按 color 染色。
+// baseline 是文本基线的 y 坐标；字形位图相对基线偏移 (bearing_x, -bearing_y)。
+static void draw_glyph_at(mat4 proj, uint32_t cp, float x, float baseline,
+		const float color[4]) {
+	struct glyph *g = get_glyph(cp);
+	if (!g)
+		return;
+	float px = x + g->bearing_x;
+	float py = baseline - g->bearing_y;
+	float u0 = (float)g->atlas_x / ATLAS_W;
+	float v0 = (float)g->atlas_y / ATLAS_H;
+	float u1 = (float)(g->atlas_x + g->w) / ATLAS_W;
+	float v1 = (float)(g->atlas_y + g->h) / ATLAS_H;
+	// 两个三角形组成一个矩形：顶点 (pos.x, pos.y, uv.u, uv.v)
+	float verts[6][4] = {
+		{px,         py,         u0, v0},
+		{px + g->w,  py,         u1, v0},
+		{px,         py + g->h,  u0, v1},
+		{px,         py + g->h,  u0, v1},
+		{px + g->w,  py,         u1, v0},
+		{px + g->w,  py + g->h,  u1, v1},
+	};
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glEnableVertexAttribArray(1);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)0);
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void *)(2 * sizeof(float)));
+
+	glUseProgram(text_prog);
+	glUniformMatrix4fv(text_proj_loc, 1, GL_FALSE, proj.m);
+	glUniform1i(atlas_loc, 0);
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, atlas_tex);
+	glUniform4f(glGetUniformLocation(text_prog, "u_color"),
+			color[0], color[1], color[2], color[3]);
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+
+	glDisableVertexAttribArray(0);
+	glDisableVertexAttribArray(1);
 }
 
 static void render(void) {
@@ -927,44 +1055,149 @@ static void render(void) {
 	if (!app.gl_ready)
 		gl_init();
 
-	// CPU 光栅化整窗内容
-	uint32_t *pixels = malloc((size_t)app.width * app.height * 4);
-	rasterize(pixels, app.width, app.height);
-
 	eglMakeCurrent(app.egl_dpy, app.egl_surf, app.egl_surf, app.egl_ctx);
 	glViewport(0, 0, app.width, app.height);
-	glBindTexture(GL_TEXTURE_2D, app.gl_tex);
+	glClearColor(0, 0, 0, 0);
+	glClear(GL_COLOR_BUFFER_BIT);
 
-	if (app.gl_has_bgra) {
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, app.width, app.height,
-				0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, pixels);
-	} else {
-		// 没有 BGRA 扩展就手动交换 R/B 通道
-		for (int i = 0; i < app.width * app.height; i++) {
-			uint32_t p = pixels[i];
-			pixels[i] = (p & 0xFF00FF00u) | ((p >> 16) & 0xFF) | ((p & 0xFF) << 16);
-		}
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, app.width, app.height,
-				0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+	// 正交投影：像素坐标 → NDC。wayland 表面 y 向下，所以 top=0, bottom=h。
+	mat4 proj = ortho(0, app.width, app.height, 0, -1, 1);
+
+	int w = app.width, h = app.height;
+
+	// 窗口主体：半透明深色圆角矩形（透出后面的桌面壁纸）
+	float body[4];
+	color_premul(0x17171a, 0.82f, body);
+	draw_rect(proj, 0, 0, w, h, CORNER_RADIUS, body);
+
+	// 标题栏：略亮、略不透明
+	float titlebar[4];
+	color_premul(0x33333b, 0.95f, titlebar);
+	draw_rect(proj, 0, 0, w, TITLEBAR_H, 0, titlebar);
+	// 标题栏下沿分隔线
+	float sep[4];
+	color_premul(0x000000, 0.4f, sep);
+	draw_rect(proj, 0, TITLEBAR_H - 1, w, 1, 0, sep);
+
+	// 红绿灯按钮（mac 顺序：红=关闭 黄=最小化 绿=最大化）
+	float cy = TITLEBAR_H / 2, r = 6;
+	float btn[4];
+	color_premul(0xff5f57, 1.0f, btn); draw_circle(proj, 20, cy, r, btn);
+	color_premul(0xfebc2e, 1.0f, btn); draw_circle(proj, 40, cy, r, btn);
+	color_premul(0x28c840, 1.0f, btn); draw_circle(proj, 60, cy, r, btn);
+
+	// 悬停时显示 ×/−/＋ 图标（mac 行为：悬停任意一个，三个都显示）
+	if (app.ptr_hover_buttons) {
+		float ic[4];
+		color_premul(0x000000, 0.55f, ic);
+		draw_glyph_at(proj, 0x00d7, 20 - 3, cy + 4, ic);  // ×
+		draw_glyph_at(proj, 0x2212, 40 - 3, cy + 4, ic);  // −
+		draw_glyph_at(proj, 0x002b, 60 - 3, cy + 4, ic);  // +
 	}
-	free(pixels);
 
-	// NDC 全屏四边形；GL 纹理坐标原点在左下，v 轴翻转
-	static const float verts[] = {
-		// pos      // tex
-		-1, -1,     0, 1,
-		 1, -1,     1, 1,
-		-1,  1,     0, 0,
-		 1,  1,     1, 0,
-	};
-	glEnableVertexAttribArray(0);
-	glEnableVertexAttribArray(1);
-	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts);
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), verts + 2);
-	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	// 居中标题（默认 gles-term；shell 通过 OSC 0/2 会改成当前命令/目录）
+	{
+		// 量标题宽度（用 advance 累加）
+		float tw = 0;
+		for (const char *p = app.title; *p; ) {
+			uint32_t cp;
+			int adv;
+			if ((*p & 0x80) == 0) { cp = (uint8_t)*p; adv = 1; }
+			else if ((*p & 0xe0) == 0xc0) { cp = ((uint8_t)*p & 0x1f) << 6 | ((uint8_t)p[1] & 0x3f); adv = 2; }
+			else if ((*p & 0xf0) == 0xe0) { cp = ((uint8_t)*p & 0x0f) << 12 | ((uint8_t)p[1] & 0x3f) << 6 | ((uint8_t)p[2] & 0x3f); adv = 3; }
+			else { cp = ((uint8_t)*p & 0x07) << 18 | ((uint8_t)p[1] & 0x3f) << 12 | ((uint8_t)p[2] & 0x3f) << 6 | ((uint8_t)p[3] & 0x3f); adv = 4; }
+			struct glyph *g = get_glyph(cp);
+			tw += g ? (float)g->advance : app.cell_w;
+			p += adv;
+		}
+		float tx = (w - tw) / 2;
+		float title_color[4];
+		color_premul(0xffffff, 0.75f, title_color);
+		for (const char *p = app.title; *p; ) {
+			uint32_t cp;
+			int adv;
+			if ((*p & 0x80) == 0) { cp = (uint8_t)*p; adv = 1; }
+			else if ((*p & 0xe0) == 0xc0) { cp = ((uint8_t)*p & 0x1f) << 6 | ((uint8_t)p[1] & 0x3f); adv = 2; }
+			else if ((*p & 0xf0) == 0xe0) { cp = ((uint8_t)*p & 0x0f) << 12 | ((uint8_t)p[1] & 0x3f) << 6 | ((uint8_t)p[2] & 0x3f); adv = 3; }
+			else { cp = ((uint8_t)*p & 0x07) << 18 | ((uint8_t)p[1] & 0x3f) << 12 | ((uint8_t)p[2] & 0x3f) << 6 | ((uint8_t)p[3] & 0x3f); adv = 4; }
+			struct glyph *g = get_glyph(cp);
+			if (g)
+				draw_glyph_at(proj, cp, tx, cy + g->bearing_y / 2.0f, title_color);
+			tx += g ? (float)g->advance : app.cell_w;
+			p += adv;
+		}
+	}
+
+	// 终端网格
+	struct cell *grid = cur_grid();
+	for (int y = 0; y < term.rows; y++) {
+		float row_y = TITLEBAR_H + TERM_PAD + y * app.cell_h;
+		float baseline = row_y + app.ascent;
+		for (int x = 0; x < term.cols; x++) {
+			struct cell *c = &grid[y * term.cols + x];
+			uint32_t fg = c->fg, bg = c->bg;
+			if (c->flags & CELL_INVERSE) {
+				uint32_t t = fg;
+				fg = (bg == COLOR_DEFAULT) ? 0x1a1a24 : bg;
+				bg = (t == COLOR_DEFAULT) ? 0xd9e6d9 : t;
+			}
+			float px = TERM_PAD + x * app.cell_w;
+			// 背景色块（默认色不画，露出窗口主体）
+			if (bg != COLOR_DEFAULT) {
+				float bgc[4];
+				color_premul(bg, 1.0f, bgc);
+				draw_rect(proj, px, row_y, app.cell_w, app.cell_h, 0, bgc);
+			}
+			// 字符
+			if (c->cp) {
+				float fgc[4];
+				if (fg == COLOR_DEFAULT)
+					color_premul(0xd9e6d9, 1.0f, fgc);
+				else
+					color_premul(fg, 1.0f, fgc);
+				draw_glyph_at(proj, c->cp, px, baseline, fgc);
+			}
+		}
+	}
+
+	// 光标方块
+	if (term.cursor_visible) {
+		float px = TERM_PAD + term.cx * app.cell_w;
+		float py = TITLEBAR_H + TERM_PAD + term.cy * app.cell_h;
+		float cur[4];
+		color_premul(0xd9e6d9, 0.85f, cur);
+		draw_rect(proj, px, py, app.cell_w, app.cell_h, 0, cur);
+		struct cell *c = cell_at(term.cx, term.cy);
+		if (c->cp) {
+			float inv[4];
+			color_premul(0x17171a, 1.0f, inv);
+			draw_glyph_at(proj, c->cp, px,
+					py + app.ascent, inv);
+		}
+	}
 
 	// swap 即提交：wayland-egl 会把渲染结果交给合成器
 	eglSwapBuffers(app.egl_dpy, app.egl_surf);
+
+	// [诊断] 第一次渲染后存一帧 PPM，供肉眼确认字符渲染（看完可删）
+	static bool saved = false;
+	if (!saved) {
+		saved = true;
+		int W = app.width, H = app.height;
+		uint8_t *px = malloc((size_t)W * H * 4);
+		glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
+		FILE *f = fopen("/tmp/gles-term-frame.ppm", "wb");
+		if (f) {
+			fprintf(f, "P6\n%d %d\n255\n", W, H);
+			for (int i = 0; i < W * H; i++) {
+				uint8_t r = px[i*4+0], g = px[i*4+1], b = px[i*4+2];
+				fputc(r, f); fputc(g, f); fputc(b, f);
+			}
+			fclose(f);
+			fprintf(stderr, "[diag] saved /tmp/gles-term-frame.ppm (%dx%d)\n", W, H);
+		}
+		free(px);
+	}
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,10 @@
+prefix=/usr
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib/x86_64-linux-gnu
+includedir=/home/hesse/compositor-test/third_party/gbm
+
+Name: gbm
+Description: GBM (Generic Buffer Management) API
+Version: 24.0.0
+Libs: ${libdir}/libgbm.so.1
+Cflags: -I${includedir}

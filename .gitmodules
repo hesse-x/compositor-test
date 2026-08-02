@@ -1,3 +1,15 @@
 [submodule "third_party/wlroots"]
 	path = third_party/wlroots
 	url = https://gitlab.freedesktop.org/wlroots/wlroots.git
+[submodule "third_party/libpng"]
+	path = third_party/libpng
+	url = https://github.com/glennrp/libpng.git
+[submodule "third_party/freetype"]
+	path = third_party/freetype
+	url = https://gitlab.freedesktop.org/freetype/freetype.git
+[submodule "third_party/wayland"]
+	path = third_party/wayland
+	url = https://gitlab.freedesktop.org/wayland/wayland.git
+[submodule "third_party/libdrm"]
+	path = third_party/libdrm
+	url = https://gitlab.freedesktop.org/mesa/drm.git
