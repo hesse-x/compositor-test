@@ -14,6 +14,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <math.h>
+#include <ctype.h>
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
@@ -642,6 +643,7 @@ struct glyph {
 
 static FT_Library ft_lib;
 static FT_Face ft_face;
+static double font_pixel_size = FONT_SIZE;
 static GLuint atlas_tex;
 // 开放寻址哈希表，避免 Unicode 码点受一个很小的直接索引数组限制。
 static struct glyph atlas_glyphs[GLYPH_CACHE_SIZE];
@@ -685,7 +687,8 @@ static struct glyph *atlas_add(FT_Face face, uint32_t cp) {
 	struct glyph *cached = glyph_lookup(cp);
 	if (cached)
 		return cached;
-	if (FT_Load_Char(face, cp, FT_LOAD_RENDER) || !face->glyph->bitmap.buffer)
+	if (FT_Load_Char(face, cp, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) ||
+			!face->glyph->bitmap.buffer)
 		return NULL;
 	struct glyph g = {
 		.cp = cp,
@@ -738,14 +741,63 @@ static struct glyph *atlas_add(FT_Face face, uint32_t cp) {
 	return glyph_insert(g);
 }
 
-// 找一个可用的 monospace 字体文件。优先 fontconfig 的结果，再退到常见路径。
+// 从桌面设置读取等宽字体（例如 "Ubuntu Sans Mono 13"）。返回的字号是 pt，
+// Wayland 逻辑像素按常见的 96 DPI 换算，和 GTK 应用的观感保持接近。
+static bool desktop_font_pattern(char *pattern, size_t pattern_size) {
+	FILE *fp = popen(
+			"gsettings get org.gnome.desktop.interface monospace-font-name 2>/dev/null",
+			"r");
+	if (!fp)
+		return false;
+	char setting[256];
+	bool ok = fgets(setting, sizeof(setting), fp) != NULL;
+	pclose(fp);
+	if (!ok)
+		return false;
+
+	setting[strcspn(setting, "\r\n")] = '\0';
+	char *value = setting;
+	if (*value == '\'' || *value == '"') {
+		char quote = *value++;
+		char *end_quote = strrchr(value, quote);
+		if (end_quote)
+			*end_quote = '\0';
+	}
+	char *size_text = strrchr(value, ' ');
+	if (!size_text)
+		return false;
+	char *end;
+	double point_size = strtod(size_text + 1, &end);
+	if (*end != '\0' || point_size <= 0 || point_size > 72)
+		return false;
+	*size_text = '\0';
+
+	// 字体名会进入下面的 fc-match shell 命令，只接受常见的安全字符。
+	for (const unsigned char *p = (const unsigned char *)value; *p; p++) {
+		if (!isalnum(*p) && *p != ' ' && *p != '-' && *p != '_')
+			return false;
+	}
+	if (snprintf(pattern, pattern_size, "%s:size=%.2f", value, point_size)
+			>= (int)pattern_size)
+		return false;
+	font_pixel_size = point_size * 96.0 / 72.0;
+	return true;
+}
+
+// 找一个可用的 monospace 字体文件。优先桌面字体设置和 fontconfig，
+// 再退到 fontconfig 的通用 monospace 及常见路径。
 static const char *find_font(void) {
 	static char path[512];
-	FILE *fp = popen("fc-match -f '%{file}' monospace 2>/dev/null", "r");
+	char pattern[256] = "monospace";
+	desktop_font_pattern(pattern, sizeof(pattern));
+	char command[512];
+	snprintf(command, sizeof(command),
+			"fc-match -f '%%{file}' '%s' 2>/dev/null", pattern);
+	FILE *fp = popen(command, "r");
 	if (fp) {
 		if (fgets(path, sizeof(path), fp)) {
 			pclose(fp);
-			if (path[0] == '/' || path[0])
+			if (path[0] == '/')
 				return path;
 		} else {
 			pclose(fp);
@@ -777,12 +829,15 @@ static void measure_font(void) {
 		fprintf(stderr, "无法加载字体 %s\n", font);
 		exit(1);
 	}
-	FT_Set_Pixel_Sizes(ft_face, 0, (int)FONT_SIZE);
+	if (FT_Set_Pixel_Sizes(ft_face, 0, (FT_UInt)lround(font_pixel_size))) {
+		fprintf(stderr, "无法设置字体大小 %.1fpx\n", font_pixel_size);
+		exit(1);
+	}
 
 	// 用 'M' 量单元格宽高（等宽字体所有字符 advance 相同）
-	FT_Load_Char(ft_face, 'M', FT_LOAD_DEFAULT);
+	FT_Load_Char(ft_face, 'M', FT_LOAD_TARGET_LIGHT);
 	app.cell_w = (int)(ft_face->glyph->advance.x >> 6);
-	FT_Load_Char(ft_face, 'M', FT_LOAD_RENDER);
+	FT_Load_Char(ft_face, 'M', FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT);
 	int ascent = ft_face->size->metrics.ascender >> 6;
 	int descent = ft_face->size->metrics.descender >> 6;
 	app.cell_h = ascent - descent;
@@ -805,8 +860,10 @@ static void atlas_init(void) {
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_W, ATLAS_H, 0,
 			GL_RGBA, GL_UNSIGNED_BYTE, empty);
 	free(empty);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	// FreeType 已经生成逐像素灰度覆盖率，1:1 绘制时不再做线性插值，
+	// 避免笔画被二次滤波后显得忽粗忽细。
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	for (uint32_t c = 0x20; c < 0x7f; c++)
@@ -833,8 +890,8 @@ static struct glyph *get_glyph(uint32_t cp) {
 // ---------------------------------------------------------------------------
 // 坐标系：用像素坐标 + 正交投影，避免每个图元都算 NDC。窗口左上角为原点，
 // y 向下（和终端网格、wayland 表面坐标一致）。
-static GLuint rect_prog, text_prog;
-static GLint rect_proj_loc, text_proj_loc, atlas_loc;
+static GLuint rect_prog, line_prog, text_prog;
+static GLint rect_proj_loc, line_proj_loc, text_proj_loc, atlas_loc;
 static GLuint vbo;
 
 static GLuint compile_shader(GLenum type, const char *src) {
@@ -916,6 +973,31 @@ static void gl_init(void) {
 	glBindAttribLocation(rect_prog, 0, "a_pos");
 	glLinkProgram(rect_prog);
 	rect_proj_loc = glGetUniformLocation(rect_prog, "u_proj");
+
+	// 圆头线段着色器：按钮图标用几何线段绘制，不受字体字形度量影响。
+	static const char *line_fs =
+		"#extension GL_OES_standard_derivatives : enable\n"
+		"precision mediump float;\n"
+		"uniform vec4 u_color;\n"
+		"uniform vec2 u_start;\n"
+		"uniform vec2 u_end;\n"
+		"uniform float u_half_width;\n"
+		"varying vec2 v_pos;\n"
+		"void main() {\n"
+		"  vec2 segment = u_end - u_start;\n"
+		"  vec2 rel = v_pos - u_start;\n"
+		"  float t = clamp(dot(rel, segment) / max(dot(segment, segment), 0.0001), 0.0, 1.0);\n"
+		"  float dist = length(rel - segment * t) - u_half_width;\n"
+		"  float aa = max(fwidth(dist), 0.001);\n"
+		"  float a = clamp(0.5 - dist / aa, 0.0, 1.0);\n"
+		"  gl_FragColor = u_color * a;\n"
+		"}\n";
+	line_prog = glCreateProgram();
+	glAttachShader(line_prog, compile_shader(GL_VERTEX_SHADER, rect_vs));
+	glAttachShader(line_prog, compile_shader(GL_FRAGMENT_SHADER, line_fs));
+	glBindAttribLocation(line_prog, 0, "a_pos");
+	glLinkProgram(line_prog);
+	line_proj_loc = glGetUniformLocation(line_prog, "u_proj");
 
 	// 字形着色器：四边形覆盖字形位图区域，采样图集纹理，按 u_color 染色。
 	// 图集把 FreeType 灰度覆盖率存在 RGBA 纹理的 alpha 通道。
@@ -1007,6 +1089,37 @@ static void draw_circle(mat4 proj, float cx, float cy, float r,
 	draw_rect(proj, cx - r, cy - r, 2 * r, 2 * r, r, color);
 }
 
+// 画一条带抗锯齿圆头的线段，width 是完整线宽。
+static void draw_line(mat4 proj, float x0, float y0, float x1, float y1,
+		float width, const float color[4]) {
+	float pad = width * 0.5f + 1.0f;
+	float left = fminf(x0, x1) - pad;
+	float top = fminf(y0, y1) - pad;
+	float right = fmaxf(x0, x1) + pad;
+	float bottom = fmaxf(y0, y1) + pad;
+	float verts[4][2] = {
+		{left,  top},
+		{right, top},
+		{left,  bottom},
+		{right, bottom},
+	};
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_DYNAMIC_DRAW);
+	glEnableVertexAttribArray(0);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (void *)0);
+
+	glUseProgram(line_prog);
+	glUniformMatrix4fv(line_proj_loc, 1, GL_FALSE, proj.m);
+	glUniform2f(glGetUniformLocation(line_prog, "u_start"), x0, y0);
+	glUniform2f(glGetUniformLocation(line_prog, "u_end"), x1, y1);
+	glUniform1f(glGetUniformLocation(line_prog, "u_half_width"), width * 0.5f);
+	glUniform4f(glGetUniformLocation(line_prog, "u_color"),
+			color[0], color[1], color[2], color[3]);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+	glDisableVertexAttribArray(0);
+}
+
 // 画一个字符（窗口像素坐标 (x, baseline)），按 color 染色。
 // baseline 是文本基线的 y 坐标；字形位图相对基线偏移 (bearing_x, -bearing_y)。
 static void draw_glyph_at(mat4 proj, uint32_t cp, float x, float baseline,
@@ -1081,18 +1194,28 @@ static void render(void) {
 
 	// 红绿灯按钮（mac 顺序：红=关闭 黄=最小化 绿=最大化）
 	float cy = TITLEBAR_H / 2, r = 6;
+	int font_descent = (ft_face->size->metrics.descender >> 6);
+	float ui_baseline = cy + (app.ascent + font_descent) / 2.0f;
 	float btn[4];
 	color_premul(0xff5f57, 1.0f, btn); draw_circle(proj, 20, cy, r, btn);
 	color_premul(0xfebc2e, 1.0f, btn); draw_circle(proj, 40, cy, r, btn);
 	color_premul(0x28c840, 1.0f, btn); draw_circle(proj, 60, cy, r, btn);
 
-	// 悬停时显示 ×/−/＋ 图标（mac 行为：悬停任意一个，三个都显示）
+	// 悬停时显示圆头几何图标；统一尺寸和线宽，确保在圆心内精确居中。
 	if (app.ptr_hover_buttons) {
 		float ic[4];
 		color_premul(0x000000, 0.55f, ic);
-		draw_glyph_at(proj, 0x00d7, 20 - 3, cy + 4, ic);  // ×
-		draw_glyph_at(proj, 0x2212, 40 - 3, cy + 4, ic);  // −
-		draw_glyph_at(proj, 0x002b, 60 - 3, cy + 4, ic);  // +
+		const float icon_r = 2.7f, icon_w = 1.6f;
+		draw_line(proj, 20 - icon_r, cy - icon_r,
+				20 + icon_r, cy + icon_r, icon_w, ic);
+		draw_line(proj, 20 - icon_r, cy + icon_r,
+				20 + icon_r, cy - icon_r, icon_w, ic);
+		draw_line(proj, 40 - icon_r, cy,
+				40 + icon_r, cy, icon_w, ic);
+		draw_line(proj, 60 - icon_r, cy,
+				60 + icon_r, cy, icon_w, ic);
+		draw_line(proj, 60, cy - icon_r,
+				60, cy + icon_r, icon_w, ic);
 	}
 
 	// 居中标题（默认 gles-term；shell 通过 OSC 0/2 会改成当前命令/目录）
@@ -1122,7 +1245,7 @@ static void render(void) {
 			else { cp = ((uint8_t)*p & 0x07) << 18 | ((uint8_t)p[1] & 0x3f) << 12 | ((uint8_t)p[2] & 0x3f) << 6 | ((uint8_t)p[3] & 0x3f); adv = 4; }
 			struct glyph *g = get_glyph(cp);
 			if (g)
-				draw_glyph_at(proj, cp, tx, cy + g->bearing_y / 2.0f, title_color);
+				draw_glyph_at(proj, cp, tx, ui_baseline, title_color);
 			tx += g ? (float)g->advance : app.cell_w;
 			p += adv;
 		}
@@ -1179,25 +1302,6 @@ static void render(void) {
 	// swap 即提交：wayland-egl 会把渲染结果交给合成器
 	eglSwapBuffers(app.egl_dpy, app.egl_surf);
 
-	// [诊断] 第一次渲染后存一帧 PPM，供肉眼确认字符渲染（看完可删）
-	static bool saved = false;
-	if (!saved) {
-		saved = true;
-		int W = app.width, H = app.height;
-		uint8_t *px = malloc((size_t)W * H * 4);
-		glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, px);
-		FILE *f = fopen("/tmp/gles-term-frame.ppm", "wb");
-		if (f) {
-			fprintf(f, "P6\n%d %d\n255\n", W, H);
-			for (int i = 0; i < W * H; i++) {
-				uint8_t r = px[i*4+0], g = px[i*4+1], b = px[i*4+2];
-				fputc(r, f); fputc(g, f); fputc(b, f);
-			}
-			fclose(f);
-			fprintf(stderr, "[diag] saved /tmp/gles-term-frame.ppm (%dx%d)\n", W, H);
-		}
-		free(px);
-	}
 }
 
 // ---------------------------------------------------------------------------
