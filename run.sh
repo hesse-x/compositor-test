@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 运行 tinywl。
-#   ./run.sh            自动检测环境运行，并启动一个终端
+#   ./run.sh            自动检测环境运行，并启动桌面 shell
 #   ./run.sh -s foot    参数原样传给 tinywl
 set -euo pipefail
 
@@ -15,9 +15,10 @@ fi
 
 # --- 参数处理：没传参数时默认 -s <程序> -----------------------------------
 if (($# == 0)); then
-	if [[ -x build/gles-term ]]; then
-		# 优先启动我们自己写的 Wayland 客户端
-		set -- -s "$PWD/build/gles-term"
+	if [[ -x build/desktop-shell ]]; then
+		# desktop-shell 提供壁纸、Dock，并由 Dock 启动终端。
+		export TINYWL_TERMINAL="$PWD/build/gles-term"
+		set -- -s "$PWD/build/desktop-shell"
 	else
 		for term in foot weston-terminal alacritty kitty wezterm gnome-terminal deepin-terminal xterm x-terminal-emulator; do
 			if command -v "$term" >/dev/null 2>&1; then

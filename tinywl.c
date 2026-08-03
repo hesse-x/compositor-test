@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <getopt.h>
+#include <linux/input-event-codes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -16,118 +17,20 @@
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
 #include <wlr/types/wlr_xdg_shell.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/util/log.h>
-#include <wlr/interfaces/wlr_buffer.h>
 #include <xkbcommon/xkbcommon.h>
-#include <drm_fourcc.h>
-#include <png.h>
 
-/* ---------- 桌面壁纸支持 ----------
- * libpng 解码 PNG → 自定义 wlr_buffer 包装像素内存 →
- * wlroots 的 GLES 渲染器通过 begin_data_ptr_access 上传纹理并渲染。
- * 路径：环境变量 TINYWL_WALLPAPER，默认相对当前目录的 wallpaper.png。
- */
-
-/* 自定义 wlr_buffer：直接包装一块 CPU 像素内存（PNG 解码结果），
- * 通过 begin_data_ptr_access 让 GLES 渲染器上传为纹理。 */
-struct pixels_buffer {
-	struct wlr_buffer base;
-	void *data;
-	size_t stride;
-};
-
-static void pixels_buffer_handle_destroy(struct wlr_buffer *wlr_buffer) {
-	struct pixels_buffer *buf = wl_container_of(wlr_buffer, buf, base);
-	free(buf->data);
-	free(buf);
-}
-
-static bool pixels_buffer_begin_data_ptr_access(struct wlr_buffer *wlr_buffer,
-		uint32_t flags, void **data, uint32_t *format, size_t *stride) {
-	if (flags & WLR_BUFFER_DATA_PTR_ACCESS_WRITE)
-		return false;
-	struct pixels_buffer *buf = wl_container_of(wlr_buffer, buf, base);
-	*data = buf->data;
-	*format = DRM_FORMAT_ARGB8888;  // 小端下内存序 B,G,R,A
-	*stride = buf->stride;
-	return true;
-}
-
-static void pixels_buffer_end_data_ptr_access(struct wlr_buffer *wlr_buffer) {}
-
-static const struct wlr_buffer_impl pixels_buffer_impl = {
-	.destroy = pixels_buffer_handle_destroy,
-	.begin_data_ptr_access = pixels_buffer_begin_data_ptr_access,
-	.end_data_ptr_access = pixels_buffer_end_data_ptr_access,
-};
-
-/* 用 libpng 把 PNG 解码为 ARGB8888（小端内存序 B,G,R,A） */
-static bool decode_png(const char *path, void **out_data,
-		int *out_w, int *out_h, size_t *out_stride) {
-	FILE *fp = fopen(path, "rb");
-	if (!fp)
-		return false;
-	png_structp png = png_create_read_struct(PNG_LIBPNG_VER_STRING,
-			NULL, NULL, NULL);
-	png_infop info = png_create_info_struct(png);
-	uint8_t *data = NULL;
-	png_bytep *rows = NULL;
-	if (setjmp(png_jmpbuf(png))) {  // libpng 出错会 longjmp 到这里
-		png_destroy_read_struct(&png, &info, NULL);
-		fclose(fp);
-		free(data);
-		free(rows);
-		return false;
-	}
-	png_init_io(png, fp);
-	png_read_info(png, info);
-
-	png_uint_32 w = png_get_image_width(png, info);
-	png_uint_32 h = png_get_image_height(png, info);
-	int color_type = png_get_color_type(png, info);
-	// 统一转换成 8bit RGBA
-	if (png_get_bit_depth(png, info) == 16)
-		png_set_strip_16(png);
-	if (color_type == PNG_COLOR_TYPE_PALETTE)
-		png_set_palette_to_rgb(png);
-	if (color_type == PNG_COLOR_TYPE_GRAY && png_get_bit_depth(png, info) < 8)
-		png_set_expand_gray_1_2_4_to_8(png);
-	if (png_get_valid(png, info, PNG_INFO_tRNS))
-		png_set_tRNS_to_alpha(png);
-	if (color_type == PNG_COLOR_TYPE_GRAY || color_type == PNG_COLOR_TYPE_GRAY_ALPHA)
-		png_set_gray_to_rgb(png);
-	png_set_add_alpha(png, 0xFF, PNG_FILLER_AFTER);  // 无 alpha 补不透明
-	png_read_update_info(png, info);
-
-	size_t stride = (size_t)w * 4;
-	data = malloc(stride * h);
-	rows = malloc(sizeof(png_bytep) * h);
-	for (png_uint_32 y = 0; y < h; y++)
-		rows[y] = data + y * stride;
-	png_read_image(png, rows);
-	png_destroy_read_struct(&png, &info, NULL);
-	fclose(fp);
-	free(rows);
-
-	// libpng 输出内存序 R,G,B,A，交换 R/B 得到 ARGB8888（B,G,R,A）
-	for (size_t i = 0; i < (size_t)w * h; i++) {
-		uint8_t t = data[i * 4];
-		data[i * 4] = data[i * 4 + 2];
-		data[i * 4 + 2] = t;
-	}
-
-	*out_data = data;
-	*out_w = w;
-	*out_h = h;
-	*out_stride = stride;
-	return true;
-}
+#define SSD_TITLE_HEIGHT 32
+#define SSD_BORDER_WIDTH 2
+#define SSD_BUTTON_SIZE 12
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -143,7 +46,15 @@ struct tinywl_server {
 	struct wlr_allocator *allocator;
 	struct wlr_scene *scene;
 	struct wlr_scene_output_layout *scene_layout;
-	struct wlr_scene_buffer *wallpaper;  // 桌面壁纸（场景最底层）
+	struct wlr_scene_tree *layer_background;
+	struct wlr_scene_tree *layer_bottom;
+	struct wlr_scene_tree *layer_toplevel;
+	struct wlr_scene_tree *layer_overlay;
+
+	struct wlr_layer_shell_v1 *layer_shell;
+	struct wl_listener new_layer_surface;
+	struct wlr_xdg_decoration_manager_v1 *decoration_manager;
+	struct wl_listener new_decoration;
 
 	struct wlr_xdg_shell *xdg_shell;
 	struct wl_listener new_xdg_toplevel;
@@ -188,6 +99,17 @@ struct tinywl_toplevel {
 	struct tinywl_server *server;
 	struct wlr_xdg_toplevel *xdg_toplevel;
 	struct wlr_scene_tree *scene_tree;
+	struct wlr_scene_tree *content_tree;
+	struct wlr_scene_rect *titlebar;
+	struct wlr_scene_rect *border_left;
+	struct wlr_scene_rect *border_right;
+	struct wlr_scene_rect *border_bottom;
+	struct wlr_scene_rect *button_close;
+	struct wlr_scene_rect *button_minimize;
+	struct wlr_scene_rect *button_maximize;
+	int content_width, content_height;
+	bool maximized;
+	int restore_x, restore_y, restore_width, restore_height;
 	struct wl_listener map;
 	struct wl_listener unmap;
 	struct wl_listener commit;
@@ -196,6 +118,14 @@ struct tinywl_toplevel {
 	struct wl_listener request_resize;
 	struct wl_listener request_maximize;
 	struct wl_listener request_fullscreen;
+};
+
+struct tinywl_layer_surface {
+	struct tinywl_server *server;
+	struct wlr_layer_surface_v1 *layer_surface;
+	struct wlr_scene_layer_surface_v1 *scene_layer;
+	struct wl_listener commit;
+	struct wl_listener destroy;
 };
 
 struct tinywl_popup {
@@ -213,6 +143,38 @@ struct tinywl_keyboard {
 	struct wl_listener key;
 	struct wl_listener destroy;
 };
+
+static void begin_interactive(struct tinywl_toplevel *toplevel,
+		enum tinywl_cursor_mode mode, uint32_t edges);
+
+static void update_ssd(struct tinywl_toplevel *toplevel) {
+	struct wlr_box geo = {0};
+	wlr_xdg_surface_get_geometry(toplevel->xdg_toplevel->base, &geo);
+	if (geo.width <= 0 || geo.height <= 0) {
+		return;
+	}
+	toplevel->content_width = geo.width;
+	toplevel->content_height = geo.height;
+
+	wlr_scene_rect_set_size(toplevel->titlebar, geo.width, SSD_TITLE_HEIGHT);
+	wlr_scene_node_set_position(&toplevel->titlebar->node, 0, -SSD_TITLE_HEIGHT);
+	wlr_scene_rect_set_size(toplevel->border_left, SSD_BORDER_WIDTH,
+		geo.height + SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH);
+	wlr_scene_node_set_position(&toplevel->border_left->node,
+		-SSD_BORDER_WIDTH, -SSD_TITLE_HEIGHT);
+	wlr_scene_rect_set_size(toplevel->border_right, SSD_BORDER_WIDTH,
+		geo.height + SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH);
+	wlr_scene_node_set_position(&toplevel->border_right->node,
+		geo.width, -SSD_TITLE_HEIGHT);
+	wlr_scene_rect_set_size(toplevel->border_bottom,
+		geo.width, SSD_BORDER_WIDTH);
+	wlr_scene_node_set_position(&toplevel->border_bottom->node, 0, geo.height);
+
+	const int button_y = -SSD_TITLE_HEIGHT / 2 - SSD_BUTTON_SIZE / 2;
+	wlr_scene_node_set_position(&toplevel->button_close->node, 12, button_y);
+	wlr_scene_node_set_position(&toplevel->button_minimize->node, 32, button_y);
+	wlr_scene_node_set_position(&toplevel->button_maximize->node, 52, button_y);
+}
 
 static void focus_toplevel(struct tinywl_toplevel *toplevel, struct wlr_surface *surface) {
 	/* Note: this function only deals with keyboard focus. */
@@ -451,29 +413,26 @@ static void seat_request_set_selection(struct wl_listener *listener, void *data)
 static struct tinywl_toplevel *desktop_toplevel_at(
 		struct tinywl_server *server, double lx, double ly,
 		struct wlr_surface **surface, double *sx, double *sy) {
-	/* This returns the topmost node in the scene at the given layout coords.
-	 * We only care about surface nodes as we are specifically looking for a
-	 * surface in the surface tree of a tinywl_toplevel. */
+	*surface = NULL;
 	struct wlr_scene_node *node = wlr_scene_node_at(
 		&server->scene->tree.node, lx, ly, sx, sy);
-	if (node == NULL || node->type != WLR_SCENE_NODE_BUFFER) {
+	if (node == NULL) {
 		return NULL;
 	}
-	struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
-	struct wlr_scene_surface *scene_surface =
-		wlr_scene_surface_try_from_buffer(scene_buffer);
-	if (!scene_surface) {
-		return NULL;
+	if (node->type == WLR_SCENE_NODE_BUFFER) {
+		struct wlr_scene_buffer *scene_buffer = wlr_scene_buffer_from_node(node);
+		struct wlr_scene_surface *scene_surface =
+			wlr_scene_surface_try_from_buffer(scene_buffer);
+		if (scene_surface != NULL) {
+			*surface = scene_surface->surface;
+		}
 	}
 
-	*surface = scene_surface->surface;
-	/* Find the node corresponding to the tinywl_toplevel at the root of this
-	 * surface tree, it is the only one for which we set the data field. */
 	struct wlr_scene_tree *tree = node->parent;
 	while (tree != NULL && tree->node.data == NULL) {
 		tree = tree->node.parent;
 	}
-	return tree->node.data;
+	return tree != NULL ? tree->node.data : NULL;
 }
 
 static void reset_cursor_mode(struct tinywl_server *server) {
@@ -623,19 +582,79 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct tinywl_server *server =
 		wl_container_of(listener, server, cursor_button);
 	struct wlr_pointer_button_event *event = data;
-	/* Notify the client with pointer focus that a button press has occurred */
-	wlr_seat_pointer_notify_button(server->seat,
-			event->time_msec, event->button, event->state);
 	double sx, sy;
 	struct wlr_surface *surface = NULL;
 	struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
 			server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		/* If you released any buttons, we exit interactive move/resize mode. */
+		if (server->seat->pointer_state.focused_surface != NULL) {
+			wlr_seat_pointer_notify_button(server->seat,
+				event->time_msec, event->button, event->state);
+		}
 		reset_cursor_mode(server);
-	} else {
-		/* Focus that client if the button was _pressed_ */
-		focus_toplevel(toplevel, surface);
+		return;
+	}
+
+	if (toplevel != NULL) {
+		focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
+	}
+	if (surface != NULL) {
+		wlr_seat_pointer_notify_button(server->seat,
+			event->time_msec, event->button, event->state);
+		return;
+	}
+	if (toplevel == NULL || event->button != BTN_LEFT) {
+		return;
+	}
+
+	int tx, ty;
+	wlr_scene_node_coords(&toplevel->scene_tree->node, &tx, &ty);
+	double rx = server->cursor->x - tx;
+	double ry = server->cursor->y - ty;
+	if (ry < 0 && ry >= -SSD_TITLE_HEIGHT) {
+		if (rx >= 12 && rx < 12 + SSD_BUTTON_SIZE) {
+			wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
+			return;
+		}
+		if (rx >= 52 && rx < 52 + SSD_BUTTON_SIZE) {
+			struct wlr_output *output = wlr_output_layout_output_at(
+				server->output_layout, server->cursor->x, server->cursor->y);
+			if (output != NULL) {
+				struct wlr_box box;
+				wlr_output_layout_get_box(server->output_layout, output, &box);
+				if (!toplevel->maximized) {
+					toplevel->restore_x = tx;
+					toplevel->restore_y = ty;
+					toplevel->restore_width = toplevel->content_width;
+					toplevel->restore_height = toplevel->content_height;
+					wlr_scene_node_set_position(&toplevel->scene_tree->node,
+						box.x + SSD_BORDER_WIDTH,
+						box.y + SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH);
+					wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+						box.width - 2 * SSD_BORDER_WIDTH,
+						box.height - SSD_TITLE_HEIGHT - 2 * SSD_BORDER_WIDTH);
+				} else {
+					wlr_scene_node_set_position(&toplevel->scene_tree->node,
+						toplevel->restore_x, toplevel->restore_y);
+					wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+						toplevel->restore_width, toplevel->restore_height);
+				}
+				toplevel->maximized = !toplevel->maximized;
+				wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel,
+					toplevel->maximized);
+			}
+			return;
+		}
+		begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
+		return;
+	}
+
+	uint32_t edges = 0;
+	if (rx < 0) edges |= WLR_EDGE_LEFT;
+	if (rx >= toplevel->content_width) edges |= WLR_EDGE_RIGHT;
+	if (ry >= toplevel->content_height) edges |= WLR_EDGE_BOTTOM;
+	if (edges != 0) {
+		begin_interactive(toplevel, TINYWL_CURSOR_RESIZE, edges);
 	}
 }
 
@@ -688,26 +707,70 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	wlr_output_commit_state(output->wlr_output, event->state);
 }
 
-/* 加载壁纸并挂到场景最底层。dest_size 在 output 创建时设置。 */
-static void load_wallpaper(struct tinywl_server *server) {
-	const char *path = getenv("TINYWL_WALLPAPER");
-	if (!path)
-		path = "wallpaper.png";
+static struct wlr_scene_tree *layer_tree_for(
+		struct tinywl_server *server, uint32_t layer) {
+	switch (layer) {
+	case ZWLR_LAYER_SHELL_V1_LAYER_BACKGROUND:
+		return server->layer_background;
+	case ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM:
+		return server->layer_bottom;
+	case ZWLR_LAYER_SHELL_V1_LAYER_TOP:
+	case ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY:
+		return server->layer_overlay;
+	default:
+		return server->layer_background;
+	}
+}
 
-	struct pixels_buffer *buf = calloc(1, sizeof(*buf));
-	int w, h;
-	if (!decode_png(path, &buf->data, &w, &h, &buf->stride)) {
-		wlr_log(WLR_ERROR, "壁纸加载失败: %s", path);
-		free(buf);
+static void configure_layer_surface(struct tinywl_layer_surface *surface) {
+	struct wlr_output *output = surface->layer_surface->output;
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(surface->server->output_layout);
+		surface->layer_surface->output = output;
+	}
+	if (output == NULL) {
 		return;
 	}
-	wlr_buffer_init(&buf->base, &pixels_buffer_impl, w, h);
+	struct wlr_box full;
+	wlr_output_layout_get_box(surface->server->output_layout, output, &full);
+	struct wlr_box usable = full;
+	wlr_scene_layer_surface_v1_configure(surface->scene_layer, &full, &usable);
+}
 
-	server->wallpaper = wlr_scene_buffer_create(&server->scene->tree, &buf->base);
-	wlr_buffer_drop(&buf->base);  // 所有权转给 scene buffer
-	wlr_scene_node_lower_to_bottom(&server->wallpaper->node);
-	wlr_scene_node_set_position(&server->wallpaper->node, 0, 0);
-	wlr_log(WLR_INFO, "壁纸已加载: %s", path);
+static void layer_surface_commit(struct wl_listener *listener, void *data) {
+	struct tinywl_layer_surface *surface =
+		wl_container_of(listener, surface, commit);
+	configure_layer_surface(surface);
+}
+
+static void layer_surface_destroy(struct wl_listener *listener, void *data) {
+	struct tinywl_layer_surface *surface =
+		wl_container_of(listener, surface, destroy);
+	wl_list_remove(&surface->commit.link);
+	wl_list_remove(&surface->destroy.link);
+	free(surface);
+}
+
+static void server_new_layer_surface(struct wl_listener *listener, void *data) {
+	struct tinywl_server *server =
+		wl_container_of(listener, server, new_layer_surface);
+	struct wlr_layer_surface_v1 *layer_surface = data;
+	if (layer_surface->output == NULL) {
+		layer_surface->output =
+			wlr_output_layout_get_center_output(server->output_layout);
+	}
+
+	struct tinywl_layer_surface *surface = calloc(1, sizeof(*surface));
+	surface->server = server;
+	surface->layer_surface = layer_surface;
+	surface->scene_layer = wlr_scene_layer_surface_v1_create(
+		layer_tree_for(server, layer_surface->current.layer), layer_surface);
+	layer_surface->data = surface;
+
+	surface->commit.notify = layer_surface_commit;
+	wl_signal_add(&layer_surface->surface->events.commit, &surface->commit);
+	surface->destroy.notify = layer_surface_destroy;
+	wl_signal_add(&layer_surface->events.destroy, &surface->destroy);
 }
 
 static void output_destroy(struct wl_listener *listener, void *data) {
@@ -783,11 +846,6 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
 
-	/* 壁纸拉伸铺满整个 output */
-	if (server->wallpaper) {
-		wlr_scene_buffer_set_dest_size(server->wallpaper,
-			wlr_output->width, wlr_output->height);
-	}
 }
 
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
@@ -795,6 +853,9 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
 
 	wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
+	if (toplevel->scene_tree->node.x == 0 && toplevel->scene_tree->node.y == 0) {
+		wlr_scene_node_set_position(&toplevel->scene_tree->node, 96, 112);
+	}
 
 	focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
 }
@@ -822,6 +883,7 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 		 * dimensions itself. */
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
 	}
+	update_ssd(toplevel);
 }
 
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
@@ -848,7 +910,7 @@ static void begin_interactive(struct tinywl_toplevel *toplevel,
 	struct tinywl_server *server = toplevel->server;
 	struct wlr_surface *focused_surface =
 		server->seat->pointer_state.focused_surface;
-	if (toplevel->xdg_toplevel->base->surface !=
+	if (focused_surface != NULL && toplevel->xdg_toplevel->base->surface !=
 			wlr_surface_get_root_surface(focused_surface)) {
 		/* Deny move/resize requests from unfocused clients. */
 		return;
@@ -936,10 +998,31 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	struct tinywl_toplevel *toplevel = calloc(1, sizeof(*toplevel));
 	toplevel->server = server;
 	toplevel->xdg_toplevel = xdg_toplevel;
-	toplevel->scene_tree =
-		wlr_scene_xdg_surface_create(&toplevel->server->scene->tree, xdg_toplevel->base);
+	toplevel->scene_tree = wlr_scene_tree_create(server->layer_toplevel);
 	toplevel->scene_tree->node.data = toplevel;
-	xdg_toplevel->base->data = toplevel->scene_tree;
+	toplevel->content_tree =
+		wlr_scene_xdg_surface_create(toplevel->scene_tree, xdg_toplevel->base);
+	xdg_toplevel->base->data = toplevel->content_tree;
+
+	const float title_color[4] = {0.20f, 0.20f, 0.23f, 1.0f};
+	const float border_color[4] = {0.08f, 0.08f, 0.09f, 1.0f};
+	const float close_color[4] = {1.0f, 0.37f, 0.34f, 1.0f};
+	const float minimize_color[4] = {1.0f, 0.74f, 0.18f, 1.0f};
+	const float maximize_color[4] = {0.16f, 0.78f, 0.25f, 1.0f};
+	toplevel->titlebar = wlr_scene_rect_create(toplevel->scene_tree,
+		1, SSD_TITLE_HEIGHT, title_color);
+	toplevel->border_left = wlr_scene_rect_create(toplevel->scene_tree,
+		SSD_BORDER_WIDTH, 1, border_color);
+	toplevel->border_right = wlr_scene_rect_create(toplevel->scene_tree,
+		SSD_BORDER_WIDTH, 1, border_color);
+	toplevel->border_bottom = wlr_scene_rect_create(toplevel->scene_tree,
+		1, SSD_BORDER_WIDTH, border_color);
+	toplevel->button_close = wlr_scene_rect_create(toplevel->scene_tree,
+		SSD_BUTTON_SIZE, SSD_BUTTON_SIZE, close_color);
+	toplevel->button_minimize = wlr_scene_rect_create(toplevel->scene_tree,
+		SSD_BUTTON_SIZE, SSD_BUTTON_SIZE, minimize_color);
+	toplevel->button_maximize = wlr_scene_rect_create(toplevel->scene_tree,
+		SSD_BUTTON_SIZE, SSD_BUTTON_SIZE, maximize_color);
 
 	/* Listen to the various events it can emit */
 	toplevel->map.notify = xdg_toplevel_map;
@@ -961,6 +1044,12 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.request_maximize, &toplevel->request_maximize);
 	toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
 	wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
+}
+
+static void server_new_decoration(struct wl_listener *listener, void *data) {
+	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+	wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
+		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
 }
 
 static void xdg_popup_commit(struct wl_listener *listener, void *data) {
@@ -1097,9 +1186,21 @@ int main(int argc, char *argv[]) {
 	 */
 	server.scene = wlr_scene_create();
 	server.scene_layout = wlr_scene_attach_output_layout(server.scene, server.output_layout);
+	server.layer_background = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_bottom = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_toplevel = wlr_scene_tree_create(&server.scene->tree);
+	server.layer_overlay = wlr_scene_tree_create(&server.scene->tree);
 
-	/* 桌面壁纸：一张 PNG 贴在场景最底层 */
-	load_wallpaper(&server);
+	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
+	server.new_layer_surface.notify = server_new_layer_surface;
+	wl_signal_add(&server.layer_shell->events.new_surface,
+		&server.new_layer_surface);
+
+	server.decoration_manager =
+		wlr_xdg_decoration_manager_v1_create(server.wl_display);
+	server.new_decoration.notify = server_new_decoration;
+	wl_signal_add(&server.decoration_manager->events.new_toplevel_decoration,
+		&server.new_decoration);
 
 	/* Set up xdg-shell version 3. The xdg-shell is a Wayland protocol which is
 	 * used for application windows. For more detail on shells, refer to

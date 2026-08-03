@@ -4,8 +4,7 @@
 //     SGR 16/256/真彩色、备用屏幕（less/htop 可用）、OSC 标题
 //   · 文字用 freetype 光栅化成字形图集纹理，GLES2 直接绘制
 //     （不依赖 cairo：矩形/圆角/圆/字符全在 GPU 上画）
-//   · mac 风标题栏：红绿灯按钮（纯装饰）+ 居中标题（跟随 OSC 0/2）
-//   · 圆角 + 半透明背景（fragment shader 里按 alpha 通道裁剪，合成器负责混合）
+//   · 窗口装饰由 compositor 统一使用 SSD 绘制
 #define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,6 +33,7 @@
 #include FT_FREETYPE_H
 
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
 
 #define FONT_SIZE 16.0
 #define TITLEBAR_H 30.0
@@ -571,6 +571,7 @@ struct app {
 	struct wl_display *display;
 	struct wl_compositor *compositor;
 	struct xdg_wm_base *wm_base;
+	struct zxdg_decoration_manager_v1 *decoration_manager;
 	struct wl_seat *seat;
 	struct wl_keyboard *keyboard;
 	struct wl_pointer *pointer;
@@ -583,6 +584,7 @@ struct app {
 	struct wl_surface *surface;
 	struct xdg_surface *xsurface;
 	struct xdg_toplevel *toplevel;
+	struct zxdg_toplevel_decoration_v1 *decoration;
 	int width, height;
 	bool closed;
 	bool configured;          // 收到首个 configure 后才能提交 buffer
@@ -618,7 +620,7 @@ static struct app app = {
 // 按窗口尺寸算出网格列/行数
 static void grid_dims(int *cols, int *rows) {
 	*cols = (int)((app.width - 2 * TERM_PAD) / app.cell_w);
-	*rows = (int)((app.height - TITLEBAR_H - 2 * TERM_PAD) / app.cell_h);
+	*rows = (int)((app.height - 2 * TERM_PAD) / app.cell_h);
 	*cols = CLAMP(*cols, 10, MAX_COLS);
 	*rows = CLAMP(*rows, 3, MAX_ROWS);
 }
@@ -959,6 +961,7 @@ static void gl_init(void) {
 		"uniform float u_radius;\n"
 		"varying vec2 v_pos;\n"
 		"void main() {\n"
+		"  if (u_radius <= 0.0) { gl_FragColor = u_color; return; }\n"
 		"  // 到矩形中心框的距离，r 为圆角半径\n"
 		"  vec2 center = u_rect.xy + u_rect.zw * 0.5;\n"
 		"  vec2 d = max(abs(v_pos - center) - (u_rect.zw * 0.5 - vec2(u_radius)), 0.0);\n"
@@ -1178,83 +1181,15 @@ static void render(void) {
 
 	int w = app.width, h = app.height;
 
-	// 窗口主体：半透明深色圆角矩形（透出后面的桌面壁纸）
+	// SSD 由 compositor 绘制；客户端只提交终端内容。
 	float body[4];
-	color_premul(0x17171a, 0.82f, body);
-	draw_rect(proj, 0, 0, w, h, CORNER_RADIUS, body);
-
-	// 标题栏：略亮、略不透明
-	float titlebar[4];
-	color_premul(0x33333b, 0.95f, titlebar);
-	draw_rect(proj, 0, 0, w, TITLEBAR_H, 0, titlebar);
-	// 标题栏下沿分隔线
-	float sep[4];
-	color_premul(0x000000, 0.4f, sep);
-	draw_rect(proj, 0, TITLEBAR_H - 1, w, 1, 0, sep);
-
-	// 红绿灯按钮（mac 顺序：红=关闭 黄=最小化 绿=最大化）
-	float cy = TITLEBAR_H / 2, r = 6;
-	int font_descent = (ft_face->size->metrics.descender >> 6);
-	float ui_baseline = cy + (app.ascent + font_descent) / 2.0f;
-	float btn[4];
-	color_premul(0xff5f57, 1.0f, btn); draw_circle(proj, 20, cy, r, btn);
-	color_premul(0xfebc2e, 1.0f, btn); draw_circle(proj, 40, cy, r, btn);
-	color_premul(0x28c840, 1.0f, btn); draw_circle(proj, 60, cy, r, btn);
-
-	// 悬停时显示圆头几何图标；统一尺寸和线宽，确保在圆心内精确居中。
-	if (app.ptr_hover_buttons) {
-		float ic[4];
-		color_premul(0x000000, 0.55f, ic);
-		const float icon_r = 2.7f, icon_w = 1.6f;
-		draw_line(proj, 20 - icon_r, cy - icon_r,
-				20 + icon_r, cy + icon_r, icon_w, ic);
-		draw_line(proj, 20 - icon_r, cy + icon_r,
-				20 + icon_r, cy - icon_r, icon_w, ic);
-		draw_line(proj, 40 - icon_r, cy,
-				40 + icon_r, cy, icon_w, ic);
-		draw_line(proj, 60 - icon_r, cy,
-				60 + icon_r, cy, icon_w, ic);
-		draw_line(proj, 60, cy - icon_r,
-				60, cy + icon_r, icon_w, ic);
-	}
-
-	// 居中标题（默认 gles-term；shell 通过 OSC 0/2 会改成当前命令/目录）
-	{
-		// 量标题宽度（用 advance 累加）
-		float tw = 0;
-		for (const char *p = app.title; *p; ) {
-			uint32_t cp;
-			int adv;
-			if ((*p & 0x80) == 0) { cp = (uint8_t)*p; adv = 1; }
-			else if ((*p & 0xe0) == 0xc0) { cp = ((uint8_t)*p & 0x1f) << 6 | ((uint8_t)p[1] & 0x3f); adv = 2; }
-			else if ((*p & 0xf0) == 0xe0) { cp = ((uint8_t)*p & 0x0f) << 12 | ((uint8_t)p[1] & 0x3f) << 6 | ((uint8_t)p[2] & 0x3f); adv = 3; }
-			else { cp = ((uint8_t)*p & 0x07) << 18 | ((uint8_t)p[1] & 0x3f) << 12 | ((uint8_t)p[2] & 0x3f) << 6 | ((uint8_t)p[3] & 0x3f); adv = 4; }
-			struct glyph *g = get_glyph(cp);
-			tw += g ? (float)g->advance : app.cell_w;
-			p += adv;
-		}
-		float tx = (w - tw) / 2;
-		float title_color[4];
-		color_premul(0xffffff, 0.75f, title_color);
-		for (const char *p = app.title; *p; ) {
-			uint32_t cp;
-			int adv;
-			if ((*p & 0x80) == 0) { cp = (uint8_t)*p; adv = 1; }
-			else if ((*p & 0xe0) == 0xc0) { cp = ((uint8_t)*p & 0x1f) << 6 | ((uint8_t)p[1] & 0x3f); adv = 2; }
-			else if ((*p & 0xf0) == 0xe0) { cp = ((uint8_t)*p & 0x0f) << 12 | ((uint8_t)p[1] & 0x3f) << 6 | ((uint8_t)p[2] & 0x3f); adv = 3; }
-			else { cp = ((uint8_t)*p & 0x07) << 18 | ((uint8_t)p[1] & 0x3f) << 12 | ((uint8_t)p[2] & 0x3f) << 6 | ((uint8_t)p[3] & 0x3f); adv = 4; }
-			struct glyph *g = get_glyph(cp);
-			if (g)
-				draw_glyph_at(proj, cp, tx, ui_baseline, title_color);
-			tx += g ? (float)g->advance : app.cell_w;
-			p += adv;
-		}
-	}
+	color_premul(0x17171a, 0.84f, body);
+	draw_rect(proj, 0, 0, w, h, 0, body);
 
 	// 终端网格
 	struct cell *grid = cur_grid();
 	for (int y = 0; y < term.rows; y++) {
-		float row_y = TITLEBAR_H + TERM_PAD + y * app.cell_h;
+		float row_y = TERM_PAD + y * app.cell_h;
 		float baseline = row_y + app.ascent;
 		for (int x = 0; x < term.cols; x++) {
 			struct cell *c = &grid[y * term.cols + x];
@@ -1286,7 +1221,7 @@ static void render(void) {
 	// 光标方块
 	if (term.cursor_visible) {
 		float px = TERM_PAD + term.cx * app.cell_w;
-		float py = TITLEBAR_H + TERM_PAD + term.cy * app.cell_h;
+		float py = TERM_PAD + term.cy * app.cell_h;
 		float cur[4];
 		color_premul(0xd9e6d9, 0.85f, cur);
 		draw_rect(proj, px, py, app.cell_w, app.cell_h, 0, cur);
@@ -1514,10 +1449,6 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 		app.keyboard = wl_seat_get_keyboard(seat);
 		wl_keyboard_add_listener(app.keyboard, &keyboard_listener, NULL);
 	}
-	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !app.pointer) {
-		app.pointer = wl_seat_get_pointer(seat);
-		wl_pointer_add_listener(app.pointer, &pointer_listener, NULL);
-	}
 }
 
 static void seat_name(void *data, struct wl_seat *seat, const char *name) {}
@@ -1608,6 +1539,9 @@ static void registry_global(void *data, struct wl_registry *registry,
 		app.wm_base = wl_registry_bind(registry, name,
 				&xdg_wm_base_interface, 1);
 		xdg_wm_base_add_listener(app.wm_base, &wm_base_listener, NULL);
+	} else if (strcmp(interface, zxdg_decoration_manager_v1_interface.name) == 0) {
+		app.decoration_manager = wl_registry_bind(registry, name,
+			&zxdg_decoration_manager_v1_interface, 1);
 	} else if (strcmp(interface, wl_seat_interface.name) == 0) {
 		app.seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
 		wl_seat_add_listener(app.seat, &seat_listener, NULL);
@@ -1651,6 +1585,12 @@ int main(void) {
 	xdg_surface_add_listener(app.xsurface, &xsurface_listener, NULL);
 	app.toplevel = xdg_surface_get_toplevel(app.xsurface);
 	xdg_toplevel_add_listener(app.toplevel, &toplevel_listener, NULL);
+	if (app.decoration_manager != NULL) {
+		app.decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+			app.decoration_manager, app.toplevel);
+		zxdg_toplevel_decoration_v1_set_mode(app.decoration,
+			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	}
 	xdg_toplevel_set_title(app.toplevel, app.title);
 	xdg_toplevel_set_app_id(app.toplevel, "gles-term");
 	wl_surface_commit(app.surface);  // 空 commit 触发首个 configure

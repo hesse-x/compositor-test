@@ -150,6 +150,12 @@ pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
 set(XDG_SHELL_XML ${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml)
 set(XDG_SHELL_H   ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h)
 set(XDG_SHELL_C   ${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c)
+set(XDG_DECORATION_XML ${WAYLAND_PROTOCOLS_DIR}/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml)
+set(XDG_DECORATION_H   ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-client-protocol.h)
+set(XDG_DECORATION_C   ${CMAKE_CURRENT_BINARY_DIR}/xdg-decoration-protocol.c)
+set(LAYER_SHELL_XML ${WLROOTS_SRC}/protocol/wlr-layer-shell-unstable-v1.xml)
+set(LAYER_SHELL_H   ${CMAKE_CURRENT_BINARY_DIR}/wlr-layer-shell-client-protocol.h)
+set(LAYER_SHELL_C   ${CMAKE_CURRENT_BINARY_DIR}/wlr-layer-shell-protocol.c)
 
 add_custom_command(
 	OUTPUT ${XDG_SHELL_H}
@@ -164,10 +170,38 @@ add_custom_command(
 	VERBATIM
 )
 
+add_custom_command(
+	OUTPUT ${XDG_DECORATION_H}
+	COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${XDG_DECORATION_XML} ${XDG_DECORATION_H}
+	DEPENDS ${XDG_DECORATION_XML}
+	VERBATIM
+)
+add_custom_command(
+	OUTPUT ${XDG_DECORATION_C}
+	COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${XDG_DECORATION_XML} ${XDG_DECORATION_C}
+	DEPENDS ${XDG_DECORATION_XML}
+	VERBATIM
+)
+
+add_custom_command(
+	OUTPUT ${LAYER_SHELL_H}
+	COMMAND ${WAYLAND_SCANNER_EXECUTABLE} client-header ${LAYER_SHELL_XML} ${LAYER_SHELL_H}
+	DEPENDS ${LAYER_SHELL_XML}
+	VERBATIM
+)
+add_custom_command(
+	OUTPUT ${LAYER_SHELL_C}
+	COMMAND ${WAYLAND_SCANNER_EXECUTABLE} private-code ${LAYER_SHELL_XML} ${LAYER_SHELL_C}
+	DEPENDS ${LAYER_SHELL_XML}
+	VERBATIM
+)
+
 add_executable(gles-term
 	terminal/gles-term.c
 	${XDG_SHELL_H}
 	${XDG_SHELL_C}
+	${XDG_DECORATION_H}
+	${XDG_DECORATION_C}
 )
 target_include_directories(gles-term PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(gles-term PRIVATE
@@ -183,3 +217,20 @@ target_link_libraries(gles-term PRIVATE
 # 运行时找得到本地编的 libfreetype.so
 set_target_properties(gles-term PROPERTIES
 	BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR}/freetype)
+
+# desktop-shell owns wallpaper and Dock as independent layer-shell surfaces.
+add_executable(desktop-shell
+	desktop/desktop-shell.c
+	${LAYER_SHELL_H}
+	${LAYER_SHELL_C}
+	${XDG_SHELL_C}
+)
+target_include_directories(desktop-shell PRIVATE
+	${CMAKE_CURRENT_BINARY_DIR}
+	${CMAKE_CURRENT_SOURCE_DIR}/third_party/libpng
+	${CMAKE_CURRENT_BINARY_DIR}/libpng)
+target_link_libraries(desktop-shell PRIVATE
+	PkgConfig::WAYLAND_CLIENT
+	png_shared)
+set_target_properties(desktop-shell PROPERTIES
+	BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR}/libpng)
