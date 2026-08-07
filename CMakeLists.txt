@@ -101,8 +101,17 @@ set(PNG_EXECUTABLES OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/libpng ${CMAKE_CURRENT_BINARY_DIR}/libpng)
 
 # ---------------------------------------------------------------------------
-# tinywl（仓库内的定制版：在官方 tinywl 基础上加了桌面壁纸支持）
+# 合成器内部特效模块。它依赖 wlroots 的不稳定 ABI，因此不作为公共 .so。
 # ---------------------------------------------------------------------------
+add_library(tinywm_effects STATIC compositor/effects/genie.c)
+target_include_directories(tinywm_effects PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(tinywm_effects PUBLIC
+	wlroots
+	PkgConfig::WAYLAND_SERVER
+	PkgConfig::PIXMAN
+	m)
+
+# tinywl（仓库内的定制版：在官方 tinywl 基础上加了桌面壁纸支持）
 add_executable(tinywl ${CMAKE_CURRENT_SOURCE_DIR}/tinywl.c)
 target_include_directories(tinywl PRIVATE
 	/usr/include/drm
@@ -115,6 +124,7 @@ target_link_libraries(tinywl PRIVATE
 	PkgConfig::PIXMAN
 	Vulkan::Vulkan
 	png_shared
+	tinywm_effects
 )
 # 让 tinywl 在构建目录里直接运行时能找到 libwlroots-0.18.so 和 libpng16.so
 set_target_properties(tinywl PROPERTIES
@@ -132,6 +142,16 @@ set(FT_DISABLE_HVF     ON CACHE BOOL "" FORCE)
 set(FT_DISABLE_PNG     ON CACHE BOOL "" FORCE)
 set(FT_REQUIRE_ZLIB    ON  CACHE BOOL "" FORCE)
 add_subdirectory(third_party/freetype ${CMAKE_CURRENT_BINARY_DIR}/freetype)
+
+# ---------------------------------------------------------------------------
+# tinyui：用户态客户端装饰组件。应用通过统一布局、绘制和命中接口创建 CSD。
+# ---------------------------------------------------------------------------
+add_library(tinyui SHARED ui/tinyui.c)
+target_include_directories(tinyui PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/ui)
+set_target_properties(tinyui PROPERTIES
+	VERSION 1.0.0
+	SOVERSION 1
+	PUBLIC_HEADER ui/tinyui.h)
 
 # ---------------------------------------------------------------------------
 # gles-term：GLES2 渲染的最小终端窗口（mac 风标题栏 + 半透明背景）。
@@ -208,13 +228,14 @@ target_link_libraries(gles-term PRIVATE
 	PkgConfig::EGL
 	PkgConfig::GLESV2
 	PkgConfig::XKBCOMMON
+	tinyui
 	freetype
 	util  # forkpty
 	m
 )
 # 运行时找得到本地编的 libfreetype.so
 set_target_properties(gles-term PROPERTIES
-	BUILD_RPATH ${CMAKE_CURRENT_BINARY_DIR}/freetype)
+	BUILD_RPATH "${CMAKE_CURRENT_BINARY_DIR};${CMAKE_CURRENT_BINARY_DIR}/freetype")
 
 # desktop-shell owns wallpaper and Dock as independent layer-shell surfaces.
 add_executable(desktop-shell

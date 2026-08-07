@@ -31,9 +31,14 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "compositor/effects/genie.h"
+
 #define SSD_TITLE_HEIGHT 32
 #define SSD_BORDER_WIDTH 2
 #define SSD_BUTTON_SIZE 12
+#define GENIE_DURATION_MS 260
+#define DOCK_HEIGHT 88
+#define DOCK_BOTTOM_MARGIN 14
 
 /* For brevity's sake, struct members are annotated where they are used. */
 enum tinywl_cursor_mode {
@@ -82,6 +87,7 @@ struct tinywl_server {
 	double grab_x, grab_y;
 	struct wlr_box grab_geobox;
 	uint32_t resize_edges;
+	bool consume_dock_click;
 
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
@@ -119,6 +125,10 @@ struct tinywl_toplevel {
 	struct wlr_scene_rect *button_maximize;
 	int content_width, content_height;
 	bool maximized;
+	bool client_side_decorated;
+	bool mapped;
+	bool minimized;
+	struct tinywl_genie_animation *animation;
 	int restore_x, restore_y, restore_width, restore_height;
 	struct wl_listener map;
 	struct wl_listener unmap;
@@ -127,7 +137,11 @@ struct tinywl_toplevel {
 	struct wl_listener request_move;
 	struct wl_listener request_resize;
 	struct wl_listener request_maximize;
+	struct wl_listener request_minimize;
 	struct wl_listener request_fullscreen;
+	struct wlr_xdg_toplevel_decoration_v1 *decoration;
+	struct wl_listener decoration_request_mode;
+	struct wl_listener decoration_destroy;
 };
 
 struct tinywl_layer_surface {
@@ -186,9 +200,19 @@ static void update_ssd(struct tinywl_toplevel *toplevel) {
 	wlr_scene_node_set_position(&toplevel->button_maximize->node, 52, button_y);
 }
 
+static void set_ssd_enabled(struct tinywl_toplevel *toplevel, bool enabled) {
+	wlr_scene_node_set_enabled(&toplevel->titlebar->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->border_left->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->border_right->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->border_bottom->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->button_close->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->button_minimize->node, enabled);
+	wlr_scene_node_set_enabled(&toplevel->button_maximize->node, enabled);
+}
+
 static void focus_toplevel(struct tinywl_toplevel *toplevel, struct wlr_surface *surface) {
 	/* Note: this function only deals with keyboard focus. */
-	if (toplevel == NULL) {
+	if (toplevel == NULL || toplevel->minimized || toplevel->animation != NULL) {
 		return;
 	}
 	struct tinywl_server *server = toplevel->server;
@@ -228,6 +252,143 @@ static void focus_toplevel(struct tinywl_toplevel *toplevel, struct wlr_surface 
 	}
 }
 
+static void focus_next_visible_toplevel(struct tinywl_server *server) {
+	struct tinywl_toplevel *candidate;
+	wl_list_for_each(candidate, &server->toplevels, link) {
+		if (candidate->mapped && !candidate->minimized &&
+				candidate->animation == NULL) {
+			focus_toplevel(candidate, candidate->xdg_toplevel->base->surface);
+			return;
+		}
+	}
+	wlr_seat_keyboard_clear_focus(server->seat);
+}
+
+static void genie_finished(void *data, bool minimizing) {
+	struct tinywl_toplevel *toplevel = data;
+	toplevel->animation = NULL;
+	if (minimizing) {
+		toplevel->minimized = true;
+		focus_next_visible_toplevel(toplevel->server);
+	} else {
+		toplevel->minimized = false;
+		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
+		focus_toplevel(toplevel, toplevel->xdg_toplevel->base->surface);
+	}
+	wlr_log(WLR_INFO, "genie.finish direction=%s",
+		minimizing ? "minimize" : "restore");
+}
+
+static bool start_genie_animation(struct tinywl_toplevel *toplevel,
+		struct wlr_output *output, bool minimizing) {
+	if (toplevel->animation != NULL || !toplevel->mapped ||
+			(minimizing && toplevel->minimized) ||
+			(!minimizing && !toplevel->minimized)) {
+		return false;
+	}
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(
+			toplevel->server->output_layout);
+	}
+	if (output == NULL || toplevel->content_width <= 0 ||
+			toplevel->content_height <= 0) {
+		return false;
+	}
+
+	int tx, ty;
+	wlr_scene_node_coords(&toplevel->scene_tree->node, &tx, &ty);
+	struct wlr_box output_box;
+	wlr_output_layout_get_box(toplevel->server->output_layout, output,
+		&output_box);
+	struct wlr_scene_rect *ssd_rects[] = {
+		toplevel->titlebar,
+		toplevel->border_left,
+		toplevel->border_right,
+		toplevel->border_bottom,
+		toplevel->button_close,
+		toplevel->button_minimize,
+		toplevel->button_maximize,
+	};
+	struct tinywl_genie_options options = {
+		.renderer = toplevel->server->renderer,
+		.event_loop = wl_display_get_event_loop(toplevel->server->wl_display),
+		.animation_parent = toplevel->server->layer_toplevel,
+		.source = &toplevel->content_tree->node,
+		.source_x = tx,
+		.source_y = ty,
+		.rects = ssd_rects,
+		.rect_count = toplevel->client_side_decorated ? 0 :
+			sizeof(ssd_rects) / sizeof(ssd_rects[0]),
+		.window = {
+			.x = tx - (toplevel->client_side_decorated ? 0 : SSD_BORDER_WIDTH),
+			.y = ty - (toplevel->client_side_decorated ? 0 : SSD_TITLE_HEIGHT),
+			.width = toplevel->content_width +
+				(toplevel->client_side_decorated ? 0 : 2 * SSD_BORDER_WIDTH),
+			.height = toplevel->content_height +
+				(toplevel->client_side_decorated ? 0 :
+					SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH),
+		},
+		.target_x = output_box.x + output_box.width * 0.5,
+		.target_y = output_box.y + output_box.height -
+			DOCK_BOTTOM_MARGIN - DOCK_HEIGHT + 41,
+		.minimizing = minimizing,
+		.duration_ms = GENIE_DURATION_MS,
+		.finished = genie_finished,
+		.data = toplevel,
+	};
+	toplevel->animation = tinywl_genie_start(&options);
+	if (toplevel->animation == NULL) {
+		return false;
+	}
+
+	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);
+	if (minimizing) {
+		wlr_xdg_toplevel_set_activated(toplevel->xdg_toplevel, false);
+		if (toplevel->server->seat->keyboard_state.focused_surface ==
+				toplevel->xdg_toplevel->base->surface) {
+			wlr_seat_keyboard_clear_focus(toplevel->server->seat);
+		}
+	}
+	return true;
+}
+
+static struct tinywl_toplevel *latest_minimized_toplevel(
+		struct tinywl_server *server) {
+	struct tinywl_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->mapped && toplevel->minimized &&
+				toplevel->animation == NULL) {
+			return toplevel;
+		}
+	}
+	return NULL;
+}
+
+static struct tinywl_toplevel *active_visible_toplevel(
+		struct tinywl_server *server) {
+	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
+	if (focused != NULL) {
+		focused = wlr_surface_get_root_surface(focused);
+	}
+	struct tinywl_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (!toplevel->mapped || toplevel->minimized ||
+				toplevel->animation != NULL) {
+			continue;
+		}
+		if (focused == toplevel->xdg_toplevel->base->surface) {
+			return toplevel;
+		}
+	}
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->mapped && !toplevel->minimized &&
+				toplevel->animation == NULL) {
+			return toplevel;
+		}
+	}
+	return NULL;
+}
+
 static void keyboard_handle_modifiers(
 		struct wl_listener *listener, void *data) {
 	/* This event is raised when a modifier key, such as shift or alt, is
@@ -260,12 +421,15 @@ static bool handle_keybinding(struct tinywl_server *server, xkb_keysym_t sym) {
 		break;
 	case XKB_KEY_F1:
 		/* Cycle to the next toplevel */
-		if (wl_list_length(&server->toplevels) < 2) {
-			break;
+		struct tinywl_toplevel *next_toplevel;
+		wl_list_for_each_reverse(next_toplevel, &server->toplevels, link) {
+			if (next_toplevel->mapped && !next_toplevel->minimized &&
+					next_toplevel->animation == NULL) {
+				focus_toplevel(next_toplevel,
+					next_toplevel->xdg_toplevel->base->surface);
+				break;
+			}
 		}
-		struct tinywl_toplevel *next_toplevel =
-			wl_container_of(server->toplevels.prev, next_toplevel, link);
-		focus_toplevel(next_toplevel, next_toplevel->xdg_toplevel->base->surface);
 		break;
 	default:
 		return false;
@@ -586,6 +750,38 @@ static void server_cursor_motion_absolute(
 	process_cursor_motion(server, event->time_msec);
 }
 
+static void set_toplevel_maximized(struct tinywl_toplevel *toplevel,
+		struct wlr_output *output, bool maximized) {
+	if (output == NULL || toplevel->maximized == maximized) {
+		wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, maximized);
+		return;
+	}
+	struct wlr_box box;
+	wlr_output_layout_get_box(toplevel->server->output_layout, output, &box);
+	if (maximized) {
+		toplevel->restore_x = toplevel->scene_tree->node.x;
+		toplevel->restore_y = toplevel->scene_tree->node.y;
+		toplevel->restore_width = toplevel->content_width;
+		toplevel->restore_height = toplevel->content_height;
+		int inset_x = toplevel->client_side_decorated ? 0 : SSD_BORDER_WIDTH;
+		int inset_y = toplevel->client_side_decorated ? 0 :
+			SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH;
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,
+			box.x + inset_x, box.y + inset_y);
+		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+			box.width - (toplevel->client_side_decorated ? 0 : 2 * SSD_BORDER_WIDTH),
+			box.height - inset_y -
+				(toplevel->client_side_decorated ? 0 : SSD_BORDER_WIDTH));
+	} else {
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,
+			toplevel->restore_x, toplevel->restore_y);
+		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+			toplevel->restore_width, toplevel->restore_height);
+	}
+	toplevel->maximized = maximized;
+	wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, maximized);
+}
+
 static void server_cursor_button(struct wl_listener *listener, void *data) {
 	/* This event is forwarded by the cursor when a pointer emits a button
 	 * event. */
@@ -597,12 +793,37 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct tinywl_toplevel *toplevel = desktop_toplevel_at(server,
 			server->cursor->x, server->cursor->y, &surface, &sx, &sy);
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
+		if (server->consume_dock_click) {
+			server->consume_dock_click = false;
+			return;
+		}
 		if (server->seat->pointer_state.focused_surface != NULL) {
 			wlr_seat_pointer_notify_button(server->seat,
 				event->time_msec, event->button, event->state);
 		}
 		reset_cursor_mode(server);
 		return;
+	}
+	if (event->button == BTN_LEFT && surface != NULL) {
+		struct wlr_surface *root = wlr_surface_get_root_surface(surface);
+		struct wlr_layer_surface_v1 *layer_surface =
+			wlr_layer_surface_v1_try_from_wlr_surface(root);
+		if (layer_surface != NULL && layer_surface->namespace != NULL &&
+				strcmp(layer_surface->namespace, "desktop-dock") == 0 &&
+				sx >= 24 && sx < 88 && sy >= 9 && sy < 73) {
+			struct tinywl_toplevel *minimized = latest_minimized_toplevel(server);
+			if (minimized != NULL && start_genie_animation(minimized,
+					layer_surface->output, false)) {
+				server->consume_dock_click = true;
+				return;
+			}
+			struct tinywl_toplevel *visible = active_visible_toplevel(server);
+			if (visible != NULL && start_genie_animation(visible,
+					layer_surface->output, true)) {
+				server->consume_dock_click = true;
+				return;
+			}
+		}
 	}
 
 	if (toplevel != NULL) {
@@ -621,39 +842,22 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	wlr_scene_node_coords(&toplevel->scene_tree->node, &tx, &ty);
 	double rx = server->cursor->x - tx;
 	double ry = server->cursor->y - ty;
-	if (ry < 0 && ry >= -SSD_TITLE_HEIGHT) {
+		if (ry < 0 && ry >= -SSD_TITLE_HEIGHT) {
 		if (rx >= 12 && rx < 12 + SSD_BUTTON_SIZE) {
 			wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
-			return;
-		}
-		if (rx >= 52 && rx < 52 + SSD_BUTTON_SIZE) {
-			struct wlr_output *output = wlr_output_layout_output_at(
-				server->output_layout, server->cursor->x, server->cursor->y);
-			if (output != NULL) {
-				struct wlr_box box;
-				wlr_output_layout_get_box(server->output_layout, output, &box);
-				if (!toplevel->maximized) {
-					toplevel->restore_x = tx;
-					toplevel->restore_y = ty;
-					toplevel->restore_width = toplevel->content_width;
-					toplevel->restore_height = toplevel->content_height;
-					wlr_scene_node_set_position(&toplevel->scene_tree->node,
-						box.x + SSD_BORDER_WIDTH,
-						box.y + SSD_TITLE_HEIGHT + SSD_BORDER_WIDTH);
-					wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
-						box.width - 2 * SSD_BORDER_WIDTH,
-						box.height - SSD_TITLE_HEIGHT - 2 * SSD_BORDER_WIDTH);
-				} else {
-					wlr_scene_node_set_position(&toplevel->scene_tree->node,
-						toplevel->restore_x, toplevel->restore_y);
-					wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
-						toplevel->restore_width, toplevel->restore_height);
-				}
-				toplevel->maximized = !toplevel->maximized;
-				wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel,
-					toplevel->maximized);
+				return;
 			}
-			return;
+			if (rx >= 32 && rx < 32 + SSD_BUTTON_SIZE) {
+				struct wlr_output *output = wlr_output_layout_output_at(
+					server->output_layout, server->cursor->x, server->cursor->y);
+				start_genie_animation(toplevel, output, true);
+				return;
+			}
+			if (rx >= 52 && rx < 52 + SSD_BUTTON_SIZE) {
+				struct wlr_output *output = wlr_output_layout_output_at(
+					server->output_layout, server->cursor->x, server->cursor->y);
+				set_toplevel_maximized(toplevel, output, !toplevel->maximized);
+				return;
 		}
 		begin_interactive(toplevel, TINYWL_CURSOR_MOVE, 0);
 		return;
@@ -811,17 +1015,25 @@ static void output_present(struct wl_listener *listener, void *data) {
 		return;
 	}
 	if (!event->presented) {
-		wlr_log(WLR_ERROR,
+		wlr_log(output->server->m2_smoke ? WLR_ERROR : WLR_DEBUG,
 			"output.first_frame: discarded name=%s commit_seq=%u",
 			output->wlr_output->name, event->commit_seq);
-		fail_async(output->server);
+		if (output->server->m2_smoke) {
+			fail_async(output->server);
+		} else {
+			output->first_frame_committed = false;
+		}
 		return;
 	}
 	if (event->when == NULL) {
-		wlr_log(WLR_ERROR,
+		wlr_log(output->server->m2_smoke ? WLR_ERROR : WLR_DEBUG,
 			"output.first_frame: synthetic_present name=%s commit_seq=%u feedback=unavailable",
 			output->wlr_output->name, event->commit_seq);
-		fail_async(output->server);
+		if (output->server->m2_smoke) {
+			fail_async(output->server);
+		} else {
+			output->first_frame_committed = false;
+		}
 		return;
 	}
 	char refresh[32] = "unknown";
@@ -1033,6 +1245,9 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	/* Called when the surface is mapped, or ready to display on-screen. */
 	struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, map);
 
+	toplevel->mapped = true;
+	toplevel->minimized = false;
+	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, true);
 	wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
 	if (toplevel->scene_tree->node.x == 0 && toplevel->scene_tree->node.y == 0) {
 		wlr_scene_node_set_position(&toplevel->scene_tree->node, 96, 112);
@@ -1049,7 +1264,13 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	if (toplevel == toplevel->server->grabbed_toplevel) {
 		reset_cursor_mode(toplevel->server);
 	}
+	if (toplevel->animation != NULL) {
+		tinywl_genie_cancel(toplevel->animation);
+		toplevel->animation = NULL;
+	}
 
+	toplevel->mapped = false;
+	toplevel->minimized = false;
 	wl_list_remove(&toplevel->link);
 }
 
@@ -1070,6 +1291,10 @@ static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	/* Called when the xdg_toplevel is destroyed. */
 	struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel, destroy);
+	if (toplevel->animation != NULL) {
+		tinywl_genie_cancel(toplevel->animation);
+		toplevel->animation = NULL;
+	}
 
 	wl_list_remove(&toplevel->map.link);
 	wl_list_remove(&toplevel->unmap.link);
@@ -1078,7 +1303,13 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&toplevel->request_move.link);
 	wl_list_remove(&toplevel->request_resize.link);
 	wl_list_remove(&toplevel->request_maximize.link);
+	wl_list_remove(&toplevel->request_minimize.link);
 	wl_list_remove(&toplevel->request_fullscreen.link);
+	if (toplevel->decoration != NULL) {
+		wl_list_remove(&toplevel->decoration_request_mode.link);
+		wl_list_remove(&toplevel->decoration_destroy.link);
+	}
+	wlr_scene_node_destroy(&toplevel->scene_tree->node);
 
 	free(toplevel);
 }
@@ -1146,18 +1377,27 @@ static void xdg_toplevel_request_resize(
 
 static void xdg_toplevel_request_maximize(
 		struct wl_listener *listener, void *data) {
-	/* This event is raised when a client would like to maximize itself,
-	 * typically because the user clicked on the maximize button on client-side
-	 * decorations. tinywl doesn't support maximization, but to conform to
-	 * xdg-shell protocol we still must send a configure.
-	 * wlr_xdg_surface_schedule_configure() is used to send an empty reply.
-	 * However, if the request was sent before an initial commit, we don't do
-	 * anything and let the client finish the initial surface setup. */
 	struct tinywl_toplevel *toplevel =
 		wl_container_of(listener, toplevel, request_maximize);
-	if (toplevel->xdg_toplevel->base->initialized) {
-		wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+	struct wlr_output *output = wlr_output_layout_output_at(
+		toplevel->server->output_layout,
+		toplevel->scene_tree->node.x, toplevel->scene_tree->node.y);
+	if (output == NULL) {
+		output = wlr_output_layout_get_center_output(
+			toplevel->server->output_layout);
 	}
+	set_toplevel_maximized(toplevel, output,
+		toplevel->xdg_toplevel->requested.maximized);
+}
+
+static void xdg_toplevel_request_minimize(
+		struct wl_listener *listener, void *data) {
+	struct tinywl_toplevel *toplevel =
+		wl_container_of(listener, toplevel, request_minimize);
+	struct wlr_output *output = wlr_output_layout_output_at(
+		toplevel->server->output_layout,
+		toplevel->scene_tree->node.x, toplevel->scene_tree->node.y);
+	start_genie_animation(toplevel, output, true);
 }
 
 static void xdg_toplevel_request_fullscreen(
@@ -1223,14 +1463,61 @@ static void server_new_xdg_toplevel(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_toplevel->events.request_resize, &toplevel->request_resize);
 	toplevel->request_maximize.notify = xdg_toplevel_request_maximize;
 	wl_signal_add(&xdg_toplevel->events.request_maximize, &toplevel->request_maximize);
+	toplevel->request_minimize.notify = xdg_toplevel_request_minimize;
+	wl_signal_add(&xdg_toplevel->events.request_minimize, &toplevel->request_minimize);
 	toplevel->request_fullscreen.notify = xdg_toplevel_request_fullscreen;
 	wl_signal_add(&xdg_toplevel->events.request_fullscreen, &toplevel->request_fullscreen);
 }
 
+static void set_decoration_mode(struct tinywl_toplevel *toplevel,
+		enum wlr_xdg_toplevel_decoration_v1_mode mode) {
+	bool client_side = mode ==
+		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE;
+	toplevel->client_side_decorated = client_side;
+	set_ssd_enabled(toplevel, !client_side);
+	wlr_xdg_toplevel_decoration_v1_set_mode(toplevel->decoration,
+		client_side ? WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE :
+		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+}
+
+static void decoration_request_mode(struct wl_listener *listener, void *data) {
+	struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel,
+		decoration_request_mode);
+	set_decoration_mode(toplevel, toplevel->decoration->requested_mode);
+}
+
+static void decoration_destroy(struct wl_listener *listener, void *data) {
+	struct tinywl_toplevel *toplevel = wl_container_of(listener, toplevel,
+		decoration_destroy);
+	wl_list_remove(&toplevel->decoration_request_mode.link);
+	wl_list_remove(&toplevel->decoration_destroy.link);
+	toplevel->decoration = NULL;
+	toplevel->client_side_decorated = false;
+	set_ssd_enabled(toplevel, true);
+}
+
 static void server_new_decoration(struct wl_listener *listener, void *data) {
 	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
-	wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
-		WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	struct wlr_scene_tree *content_tree = decoration->toplevel->base->data;
+	if (content_tree == NULL || content_tree->node.parent == NULL) {
+		wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
+			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		return;
+	}
+	struct tinywl_toplevel *toplevel = content_tree->node.parent->node.data;
+	if (toplevel == NULL) {
+		wlr_xdg_toplevel_decoration_v1_set_mode(decoration,
+			WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		return;
+	}
+
+	toplevel->decoration = decoration;
+	toplevel->decoration_request_mode.notify = decoration_request_mode;
+	wl_signal_add(&decoration->events.request_mode,
+		&toplevel->decoration_request_mode);
+	toplevel->decoration_destroy.notify = decoration_destroy;
+	wl_signal_add(&decoration->events.destroy, &toplevel->decoration_destroy);
+	set_decoration_mode(toplevel, decoration->requested_mode);
 }
 
 static void xdg_popup_commit(struct wl_listener *listener, void *data) {

@@ -4,7 +4,7 @@
 //     SGR 16/256/真彩色、备用屏幕（less/htop 可用）、OSC 标题
 //   · 文字用 freetype 光栅化成字形图集纹理，GLES2 直接绘制
 //     （不依赖 cairo：矩形/圆角/圆/字符全在 GPU 上画）
-//   · 窗口装饰由 compositor 统一使用 SSD 绘制
+//   · 标题栏和边框由 libtinyui 统一绘制，窗口动画由 compositor 负责
 #define _GNU_SOURCE
 #include <stdbool.h>
 #include <stdint.h>
@@ -34,9 +34,9 @@
 
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-client-protocol.h"
+#include "tinyui.h"
 
 #define FONT_SIZE 16.0
-#define TITLEBAR_H 30.0
 #define CORNER_RADIUS 10.0
 #define TERM_PAD 12.0
 
@@ -586,6 +586,7 @@ struct app {
 	struct xdg_toplevel *toplevel;
 	struct zxdg_toplevel_decoration_v1 *decoration;
 	int width, height;
+	struct tinyui_frame frame;
 	bool closed;
 	bool configured;          // 收到首个 configure 后才能提交 buffer
 	char title[256];          // 标题栏文字（OSC 0/2 可改）
@@ -612,15 +613,17 @@ struct app {
 };
 
 static struct app app = {
-	.width = 720, .height = 460,
+	.width = 724, .height = 494,
 	.title = "gles-term",
 	.pty_fd = -1,
 };
 
 // 按窗口尺寸算出网格列/行数
 static void grid_dims(int *cols, int *rows) {
-	*cols = (int)((app.width - 2 * TERM_PAD) / app.cell_w);
-	*rows = (int)((app.height - 2 * TERM_PAD) / app.cell_h);
+	struct tinyui_box content;
+	tinyui_frame_content_box(&app.frame, &content);
+	*cols = (int)((content.width - 2 * TERM_PAD) / app.cell_w);
+	*rows = (int)((content.height - 2 * TERM_PAD) / app.cell_h);
 	*cols = CLAMP(*cols, 10, MAX_COLS);
 	*rows = CLAMP(*rows, 3, MAX_ROWS);
 }
@@ -1165,6 +1168,16 @@ static void draw_glyph_at(mat4 proj, uint32_t cp, float x, float baseline,
 	glDisableVertexAttribArray(1);
 }
 
+struct frame_painter {
+	mat4 projection;
+};
+
+static void paint_frame_rect(void *data, int x, int y, int width, int height,
+		float radius, const float color[4]) {
+	struct frame_painter *painter = data;
+	draw_rect(painter->projection, x, y, width, height, radius, color);
+}
+
 static void render(void) {
 	if (!app.configured)
 		return;  // xdg-shell 要求先 ack 首个 configure 才能提交 buffer
@@ -1179,17 +1192,21 @@ static void render(void) {
 	// 正交投影：像素坐标 → NDC。wayland 表面 y 向下，所以 top=0, bottom=h。
 	mat4 proj = ortho(0, app.width, app.height, 0, -1, 1);
 
-	int w = app.width, h = app.height;
+	struct tinyui_box content;
+	tinyui_frame_content_box(&app.frame, &content);
 
-	// SSD 由 compositor 绘制；客户端只提交终端内容。
+	// libtinyui owns the client-side frame; the terminal paints only content.
 	float body[4];
 	color_premul(0x17171a, 0.84f, body);
-	draw_rect(proj, 0, 0, w, h, 0, body);
+	draw_rect(proj, content.x, content.y, content.width, content.height,
+		CORNER_RADIUS, body);
+	struct frame_painter painter = {.projection = proj};
+	tinyui_frame_paint(&app.frame, paint_frame_rect, &painter);
 
 	// 终端网格
 	struct cell *grid = cur_grid();
 	for (int y = 0; y < term.rows; y++) {
-		float row_y = TERM_PAD + y * app.cell_h;
+		float row_y = content.y + TERM_PAD + y * app.cell_h;
 		float baseline = row_y + app.ascent;
 		for (int x = 0; x < term.cols; x++) {
 			struct cell *c = &grid[y * term.cols + x];
@@ -1199,7 +1216,7 @@ static void render(void) {
 				fg = (bg == COLOR_DEFAULT) ? 0x1a1a24 : bg;
 				bg = (t == COLOR_DEFAULT) ? 0xd9e6d9 : t;
 			}
-			float px = TERM_PAD + x * app.cell_w;
+			float px = content.x + TERM_PAD + x * app.cell_w;
 			// 背景色块（默认色不画，露出窗口主体）
 			if (bg != COLOR_DEFAULT) {
 				float bgc[4];
@@ -1220,8 +1237,8 @@ static void render(void) {
 
 	// 光标方块
 	if (term.cursor_visible) {
-		float px = TERM_PAD + term.cx * app.cell_w;
-		float py = TERM_PAD + term.cy * app.cell_h;
+		float px = content.x + TERM_PAD + term.cx * app.cell_w;
+		float py = content.y + TERM_PAD + term.cy * app.cell_h;
 		float cur[4];
 		color_premul(0xd9e6d9, 0.85f, cur);
 		draw_rect(proj, px, py, app.cell_w, app.cell_h, 0, cur);
@@ -1333,6 +1350,16 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
 	if (width > 0 && height > 0) {
 		app.width = width;
 		app.height = height;
+		tinyui_frame_set_size(&app.frame, width, height);
+	}
+	app.frame.maximized = false;
+	app.frame.active = false;
+	uint32_t *state;
+	wl_array_for_each(state, states) {
+		if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
+			app.frame.maximized = true;
+		else if (*state == XDG_TOPLEVEL_STATE_ACTIVATED)
+			app.frame.active = true;
 	}
 }
 
@@ -1343,6 +1370,17 @@ static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
 static const struct xdg_toplevel_listener toplevel_listener = {
 	.configure = toplevel_configure,
 	.close = toplevel_close,
+};
+
+static void decoration_configure(void *data,
+		struct zxdg_toplevel_decoration_v1 *decoration, uint32_t mode) {
+	if (mode != ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+		fprintf(stderr, "gles-term: compositor rejected client-side decorations\n");
+	}
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
+	.configure = decoration_configure,
 };
 
 // ---------------------------------------------------------------------------
@@ -1454,17 +1492,20 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
 static void seat_name(void *data, struct wl_seat *seat, const char *name) {}
 
 // ---------------------------------------------------------------------------
-// 指针输入：标题栏拖拽移动、红钮关闭、红绿灯 hover
+// 指针输入：libtinyui 统一完成标题栏、按钮和 resize 命中检测
 // ---------------------------------------------------------------------------
-// 命中检测：红绿灯圆心在 (20/40/60, TITLEBAR_H/2)，点击半径给宽松一点
-static int hit_traffic_button(double x, double y) {
-	static const double btn_x[3] = { 20, 40, 60 };
-	for (int i = 0; i < 3; i++) {
-		double dx = x - btn_x[i], dy = y - TITLEBAR_H / 2;
-		if (dx * dx + dy * dy <= 9 * 9)
-			return i;  // 0=红 1=黄 2=绿
+static uint32_t resize_edge_for_part(enum tinyui_frame_part part) {
+	switch (part) {
+	case TINYUI_FRAME_RESIZE_TOP: return XDG_TOPLEVEL_RESIZE_EDGE_TOP;
+	case TINYUI_FRAME_RESIZE_BOTTOM: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM;
+	case TINYUI_FRAME_RESIZE_LEFT: return XDG_TOPLEVEL_RESIZE_EDGE_LEFT;
+	case TINYUI_FRAME_RESIZE_RIGHT: return XDG_TOPLEVEL_RESIZE_EDGE_RIGHT;
+	case TINYUI_FRAME_RESIZE_TOP_LEFT: return XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT;
+	case TINYUI_FRAME_RESIZE_TOP_RIGHT: return XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT;
+	case TINYUI_FRAME_RESIZE_BOTTOM_LEFT: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT;
+	case TINYUI_FRAME_RESIZE_BOTTOM_RIGHT: return XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT;
+	default: return XDG_TOPLEVEL_RESIZE_EDGE_NONE;
 	}
-	return -1;
 }
 
 static void pointer_enter(void *data, struct wl_pointer *pointer,
@@ -1486,8 +1527,9 @@ static void pointer_motion(void *data, struct wl_pointer *pointer,
 		uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
 	app.ptr_x = wl_fixed_to_double(sx);
 	app.ptr_y = wl_fixed_to_double(sy);
-	// hover 区域：标题栏左侧红绿灯一带
-	bool hover = app.ptr_y < TITLEBAR_H && app.ptr_x < 80;
+	enum tinyui_frame_part part = tinyui_frame_hit_test(
+		&app.frame, app.ptr_x, app.ptr_y);
+	bool hover = part >= TINYUI_FRAME_CLOSE && part <= TINYUI_FRAME_MAXIMIZE;
 	if (hover != app.ptr_hover_buttons) {
 		app.ptr_hover_buttons = hover;
 		render();
@@ -1498,17 +1540,31 @@ static void pointer_button(void *data, struct wl_pointer *pointer,
 		uint32_t serial, uint32_t time, uint32_t button, uint32_t state) {
 	if (button != BTN_LEFT || state != WL_POINTER_BUTTON_STATE_PRESSED)
 		return;
-	if (app.ptr_y >= TITLEBAR_H)
-		return;  // 点击正文区域：无操作
-
-	int btn = hit_traffic_button(app.ptr_x, app.ptr_y);
-	if (btn == 0) {
-		app.closed = true;  // 红钮：关闭窗口
-	} else if (btn < 0) {
-		// 标题栏空白处：请求合成器开始交互式拖拽移动
+	enum tinyui_frame_part part = tinyui_frame_hit_test(
+		&app.frame, app.ptr_x, app.ptr_y);
+	switch (part) {
+	case TINYUI_FRAME_CLOSE:
+		app.closed = true;
+		break;
+	case TINYUI_FRAME_MINIMIZE:
+		xdg_toplevel_set_minimized(app.toplevel);
+		break;
+	case TINYUI_FRAME_MAXIMIZE:
+		if (app.frame.maximized)
+			xdg_toplevel_unset_maximized(app.toplevel);
+		else
+			xdg_toplevel_set_maximized(app.toplevel);
+		break;
+	case TINYUI_FRAME_TITLE:
 		xdg_toplevel_move(app.toplevel, app.seat, serial);
+		break;
+	default: {
+		uint32_t edge = resize_edge_for_part(part);
+		if (edge != XDG_TOPLEVEL_RESIZE_EDGE_NONE)
+			xdg_toplevel_resize(app.toplevel, app.seat, serial, edge);
+		break;
 	}
-	// 黄/绿钮：纯装饰，无操作
+	}
 }
 
 static void pointer_axis(void *data, struct wl_pointer *pointer,
@@ -1560,6 +1616,7 @@ static const struct wl_registry_listener registry_listener = {
 int main(void) {
 	palette_init();
 	measure_font();
+	tinyui_frame_init(&app.frame, app.width, app.height);
 	int cols, rows;
 	grid_dims(&cols, &rows);
 	term_init(cols, rows);
@@ -1588,8 +1645,10 @@ int main(void) {
 	if (app.decoration_manager != NULL) {
 		app.decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
 			app.decoration_manager, app.toplevel);
+		zxdg_toplevel_decoration_v1_add_listener(app.decoration,
+			&decoration_listener, NULL);
 		zxdg_toplevel_decoration_v1_set_mode(app.decoration,
-			ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+			ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
 	}
 	xdg_toplevel_set_title(app.toplevel, app.title);
 	xdg_toplevel_set_app_id(app.toplevel, "gles-term");
