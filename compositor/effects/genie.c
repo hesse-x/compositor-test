@@ -6,7 +6,10 @@
 #include <wlr/render/wlr_texture.h>
 #include <wlr/util/log.h>
 
-#define GENIE_STRIPS 48
+#define GENIE_MAX_COLUMNS 28
+#define GENIE_MAX_ROWS 48
+#define GENIE_TILE_WIDTH 28
+#define GENIE_TILE_HEIGHT 18
 
 enum genie_piece_type {
 	GENIE_PIECE_BUFFER,
@@ -46,6 +49,54 @@ static double smoothstep(double value) {
 	return value * value * (3.0 - 2.0 * value);
 }
 
+static double mix(double from, double to, double amount) {
+	return from + (to - from) * amount;
+}
+
+struct genie_point {
+	double x, y;
+};
+
+/*
+ * Bend rows into the dock at different rates, then add a small travelling
+ * ripple across the window. The ripple is zero at both ends of the animation,
+ * so minimize and restore remain exact inverses of one another.
+ */
+static struct genie_point warp_point(
+		const struct tinywl_genie_options *options,
+		double nx, double ny, double progress) {
+	const double target_width = 14.0;
+	const double target_height = 6.0;
+	const double row_delay = (1.0 - ny) * 0.24;
+	const double row_progress = smoothstep(
+		(progress - row_delay) / (1.0 - row_delay));
+	const double transition = sin(M_PI * progress);
+	const double source_center = options->window.x + options->window.width * 0.5;
+
+	/* The narrowing neck and lateral ripple form the characteristic S-curve. */
+	double center = mix(source_center, options->target_x, row_progress);
+	double width = mix(options->window.width, target_width, row_progress);
+	double vertical_envelope = sin(M_PI * ny);
+	center += options->window.width * 0.018 * transition * vertical_envelope *
+		sin(2.0 * M_PI * (ny - progress * 0.32));
+	width *= 1.0 - 0.10 * transition * vertical_envelope;
+
+	double original_y = options->window.y + options->window.height * ny;
+	double target_y = options->target_y + (ny - 0.5) * target_height;
+	double y = mix(original_y, target_y, row_progress);
+
+	/* Vary horizontal compression without shearing tile edges across rows. */
+	double fold = fmin(12.0, width * 0.025) * transition *
+		vertical_envelope * (1.0 - 0.55 * row_progress);
+	double x = center + (nx - 0.5) * width;
+	x += fold * sin(2.0 * M_PI * nx + M_PI * (ny - progress));
+
+	return (struct genie_point) {
+		.x = x,
+		.y = y,
+	};
+}
+
 static void destroy_animation(struct tinywl_genie_animation *animation) {
 	if (animation->timer != NULL) {
 		wl_event_source_remove(animation->timer);
@@ -79,40 +130,24 @@ void tinywl_genie_cancel(struct tinywl_genie_animation *animation) {
 
 static void update_animation(struct tinywl_genie_animation *animation,
 		double progress) {
-	const double target_width = 14.0;
-	const double target_height = 6.0;
-	const double vertical_progress = smoothstep(progress);
 	const struct tinywl_genie_options *options = &animation->options;
 	struct genie_piece *piece;
 	wl_list_for_each(piece, &animation->pieces, link) {
-		double vertical_center = (piece->ny0 + piece->ny1) * 0.5;
-		double delay = (1.0 - vertical_center) * 0.24;
-		double side_progress = smoothstep((progress - delay) / (1.0 - delay));
-		double left = options->window.x * (1.0 - side_progress) +
-			(options->target_x - target_width * 0.5) * side_progress;
-		double right = (options->window.x + options->window.width) *
-			(1.0 - side_progress) +
-			(options->target_x + target_width * 0.5) * side_progress;
-		double x0 = left + (right - left) * piece->nx0;
-		double x1 = left + (right - left) * piece->nx1;
+		double row_center = (piece->ny0 + piece->ny1) * 0.5;
+		struct genie_point left = warp_point(
+			options, piece->nx0, row_center, progress);
+		struct genie_point right = warp_point(
+			options, piece->nx1, row_center, progress);
+		struct genie_point top = warp_point(
+			options, 0.5, piece->ny0, progress);
+		struct genie_point bottom = warp_point(
+			options, 0.5, piece->ny1, progress);
 
-		double original_y0 = options->window.y +
-			options->window.height * piece->ny0;
-		double original_y1 = options->window.y +
-			options->window.height * piece->ny1;
-		double target_y0 = options->target_y +
-			(piece->ny0 - 0.5) * target_height;
-		double target_y1 = options->target_y +
-			(piece->ny1 - 0.5) * target_height;
-		double y0 = original_y0 * (1.0 - vertical_progress) +
-			target_y0 * vertical_progress;
-		double y1 = original_y1 * (1.0 - vertical_progress) +
-			target_y1 * vertical_progress;
-
-		int x = (int)lround(x0);
-		int y = (int)lround(y0);
-		int width = (int)lround(x1 - x0);
-		int height = (int)lround(y1 - y0);
+		/* Shared rounded boundaries avoid both gaps and double alpha blending. */
+		int x = (int)lround(left.x);
+		int y = (int)lround(top.y);
+		int width = (int)lround(right.x) - x;
+		int height = (int)lround(bottom.y) - y;
 		if (width < 1) width = 1;
 		if (height < 1) height = 1;
 		if (piece->type == GENIE_PIECE_BUFFER) {
@@ -123,6 +158,13 @@ static void update_animation(struct tinywl_genie_animation *animation,
 			wlr_scene_rect_set_size(piece->rect, width, height);
 		}
 	}
+}
+
+static int tile_count(int length, int tile_size, int maximum) {
+	int count = (length + tile_size - 1) / tile_size;
+	if (count < 1) count = 1;
+	if (count > maximum) count = maximum;
+	return count;
 }
 
 static int animation_timer(void *data) {
@@ -196,36 +238,41 @@ static void add_buffer_slices(struct wlr_scene_buffer *source,
 	if (display_width <= 0 || display_height <= 0) {
 		return;
 	}
-	int strips = display_height < GENIE_STRIPS ? display_height : GENIE_STRIPS;
-	for (int i = 0; i < strips; i++) {
-		int y0 = i * display_height / strips;
-		int y1 = (i + 1) * display_height / strips;
-		int global_x = animation->options.source_x + sx;
-		int global_y = animation->options.source_y + sy;
-		struct genie_piece *piece = new_piece(animation,
-			global_x, global_y + y0,
-			global_x + display_width, global_y + y1);
-		if (piece == NULL) {
-			return;
+	int columns = tile_count(display_width, GENIE_TILE_WIDTH, GENIE_MAX_COLUMNS);
+	int rows = tile_count(display_height, GENIE_TILE_HEIGHT, GENIE_MAX_ROWS);
+	for (int row = 0; row < rows; row++) {
+		int y0 = row * display_height / rows;
+		int y1 = (row + 1) * display_height / rows;
+		for (int column = 0; column < columns; column++) {
+			int x0 = column * display_width / columns;
+			int x1 = (column + 1) * display_width / columns;
+			int global_x = animation->options.source_x + sx;
+			int global_y = animation->options.source_y + sy;
+			struct genie_piece *piece = new_piece(animation,
+				global_x + x0, global_y + y0,
+				global_x + x1, global_y + y1);
+			if (piece == NULL) {
+				return;
+			}
+			struct wlr_fbox tile_box = {
+				.x = source_box.x + source_box.width * x0 / display_width,
+				.y = source_box.y + source_box.height * y0 / display_height,
+				.width = source_box.width * (x1 - x0) / display_width,
+				.height = source_box.height * (y1 - y0) / display_height,
+			};
+			piece->type = GENIE_PIECE_BUFFER;
+			piece->buffer = wlr_scene_buffer_create(animation->tree, NULL);
+			if (piece->buffer == NULL) {
+				wl_list_remove(&piece->link);
+				free(piece);
+				return;
+			}
+			piece->buffer->texture = snapshot->texture;
+			wlr_scene_buffer_set_source_box(piece->buffer, &tile_box);
+			wlr_scene_buffer_set_dest_size(piece->buffer, x1 - x0, y1 - y0);
+			wlr_scene_buffer_set_opacity(piece->buffer, source->opacity);
+			wlr_scene_buffer_set_filter_mode(piece->buffer, source->filter_mode);
 		}
-		struct wlr_fbox strip_box = {
-			.x = source_box.x,
-			.y = source_box.y + source_box.height * y0 / display_height,
-			.width = source_box.width,
-			.height = source_box.height * (y1 - y0) / display_height,
-		};
-		piece->type = GENIE_PIECE_BUFFER;
-		piece->buffer = wlr_scene_buffer_create(animation->tree, NULL);
-		if (piece->buffer == NULL) {
-			wl_list_remove(&piece->link);
-			free(piece);
-			return;
-		}
-		piece->buffer->texture = snapshot->texture;
-		wlr_scene_buffer_set_source_box(piece->buffer, &strip_box);
-		wlr_scene_buffer_set_dest_size(piece->buffer, display_width, y1 - y0);
-		wlr_scene_buffer_set_opacity(piece->buffer, source->opacity);
-		wlr_scene_buffer_set_filter_mode(piece->buffer, source->filter_mode);
 	}
 }
 
@@ -237,22 +284,27 @@ static void add_rect_slices(struct tinywl_genie_animation *animation,
 	if (source->width <= 0 || source->height <= 0) {
 		return;
 	}
-	int strips = source->height < GENIE_STRIPS ? source->height : GENIE_STRIPS;
-	for (int i = 0; i < strips; i++) {
-		int y0 = i * source->height / strips;
-		int y1 = (i + 1) * source->height / strips;
-		struct genie_piece *piece = new_piece(animation,
-			sx, sy + y0, sx + source->width, sy + y1);
-		if (piece == NULL) {
-			return;
-		}
-		piece->type = GENIE_PIECE_RECT;
-		piece->rect = wlr_scene_rect_create(animation->tree,
-			source->width, y1 - y0, source->color);
-		if (piece->rect == NULL) {
-			wl_list_remove(&piece->link);
-			free(piece);
-			return;
+	int columns = tile_count(source->width, GENIE_TILE_WIDTH, GENIE_MAX_COLUMNS);
+	int rows = tile_count(source->height, GENIE_TILE_HEIGHT, GENIE_MAX_ROWS);
+	for (int row = 0; row < rows; row++) {
+		int y0 = row * source->height / rows;
+		int y1 = (row + 1) * source->height / rows;
+		for (int column = 0; column < columns; column++) {
+			int x0 = column * source->width / columns;
+			int x1 = (column + 1) * source->width / columns;
+			struct genie_piece *piece = new_piece(animation,
+				sx + x0, sy + y0, sx + x1, sy + y1);
+			if (piece == NULL) {
+				return;
+			}
+			piece->type = GENIE_PIECE_RECT;
+			piece->rect = wlr_scene_rect_create(animation->tree,
+				x1 - x0, y1 - y0, source->color);
+			if (piece->rect == NULL) {
+				wl_list_remove(&piece->link);
+				free(piece);
+				return;
+			}
 		}
 	}
 }
