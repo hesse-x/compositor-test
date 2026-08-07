@@ -1,14 +1,17 @@
 #include <assert.h>
+#include <errno.h>
 #include <getopt.h>
 #include <linux/input-event-codes.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
 #include <wlr/backend.h>
 #include <wlr/render/allocator.h>
+#include <wlr/render/vulkan.h>
 #include <wlr/render/wlr_renderer.h>
 #include <wlr/types/wlr_cursor.h>
 #include <wlr/types/wlr_compositor.h>
@@ -83,6 +86,9 @@ struct tinywl_server {
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs;
 	struct wl_listener new_output;
+	bool m2_smoke;
+	const char *m2_fault;
+	int exit_status;
 };
 
 struct tinywl_output {
@@ -90,8 +96,12 @@ struct tinywl_output {
 	struct tinywl_server *server;
 	struct wlr_output *wlr_output;
 	struct wl_listener frame;
+	struct wl_listener present;
 	struct wl_listener request_state;
 	struct wl_listener destroy;
+	struct wlr_scene_output *scene_output;
+	uint32_t first_frame_commit_seq;
+	bool first_frame_committed;
 };
 
 struct tinywl_toplevel {
@@ -681,21 +691,150 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 	wlr_seat_pointer_notify_frame(server->seat);
 }
 
+static bool has_device_extension(VkPhysicalDevice physical_device,
+		const char *name) {
+	uint32_t count = 0;
+	if (vkEnumerateDeviceExtensionProperties(physical_device, NULL,
+			&count, NULL) != VK_SUCCESS) {
+		return false;
+	}
+	VkExtensionProperties *extensions = calloc(count, sizeof(*extensions));
+	if (count > 0 && extensions == NULL) {
+		return false;
+	}
+	VkResult result = vkEnumerateDeviceExtensionProperties(physical_device,
+		NULL, &count, extensions);
+	bool found = false;
+	if (result == VK_SUCCESS) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (strcmp(extensions[i].extensionName, name) == 0) {
+				found = true;
+				break;
+			}
+		}
+	}
+	free(extensions);
+	return found;
+}
+
+static bool verify_vulkan_device(struct wlr_renderer *renderer) {
+	VkPhysicalDevice physical_device =
+		wlr_vk_renderer_get_physical_device(renderer);
+	VkPhysicalDeviceProperties base;
+	vkGetPhysicalDeviceProperties(physical_device, &base);
+
+	if (VK_API_VERSION_MAJOR(base.apiVersion) < 1 ||
+			(VK_API_VERSION_MAJOR(base.apiVersion) == 1 &&
+			VK_API_VERSION_MINOR(base.apiVersion) < 1)) {
+		wlr_log(WLR_ERROR, "renderer.device: failed reason=Vulkan-1.1-required");
+		return false;
+	}
+	if (VK_API_VERSION_MAJOR(base.apiVersion) == 1 &&
+			VK_API_VERSION_MINOR(base.apiVersion) < 2 &&
+			!has_device_extension(physical_device, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
+		wlr_log(WLR_ERROR,
+			"renderer.device: failed reason=VK_KHR_driver_properties-unavailable");
+		return false;
+	}
+
+	VkPhysicalDeviceDriverProperties driver = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+	};
+	VkPhysicalDeviceProperties2 properties = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+		.pNext = &driver,
+	};
+	vkGetPhysicalDeviceProperties2(physical_device, &properties);
+	if (properties.properties.deviceType !=
+			VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) {
+		wlr_log(WLR_ERROR,
+			"renderer.device: failed name=%s reason=expected-integrated-gpu type=%d",
+			properties.properties.deviceName, properties.properties.deviceType);
+		return false;
+	}
+	if (driver.driverID != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA) {
+		wlr_log(WLR_ERROR,
+			"renderer.device: failed name=%s reason=expected-intel-anv driver_id=%d driver=%s",
+			properties.properties.deviceName, driver.driverID, driver.driverName);
+		return false;
+	}
+	wlr_log(WLR_INFO,
+		"renderer.device: ok name=%s driver=anv driver_name=%s driver_info=%s type=integrated api=%u.%u.%u",
+		properties.properties.deviceName, driver.driverName, driver.driverInfo,
+		VK_API_VERSION_MAJOR(properties.properties.apiVersion),
+		VK_API_VERSION_MINOR(properties.properties.apiVersion),
+		VK_API_VERSION_PATCH(properties.properties.apiVersion));
+	return true;
+}
+
+static void fail_async(struct tinywl_server *server) {
+	server->exit_status = 1;
+	wl_display_terminate(server->wl_display);
+}
+
 static void output_frame(struct wl_listener *listener, void *data) {
 	/* This function is called every time an output is ready to display a frame,
 	 * generally at the output's refresh rate (e.g. 60Hz). */
 	struct tinywl_output *output = wl_container_of(listener, output, frame);
-	struct wlr_scene *scene = output->server->scene;
-
-	struct wlr_scene_output *scene_output = wlr_scene_get_scene_output(
-		scene, output->wlr_output);
-
-	/* Render the scene if needed and commit the output */
-	wlr_scene_output_commit(scene_output, NULL);
+	struct wlr_scene_output *scene_output = output->scene_output;
+	uint32_t before = output->wlr_output->commit_seq;
+	bool inject_failure = output->server->m2_smoke &&
+		output->server->m2_fault != NULL &&
+		strcmp(output->server->m2_fault, "scene-commit") == 0;
+	bool committed = !inject_failure &&
+		wlr_scene_output_commit(scene_output, NULL);
+	if (!committed) {
+		wlr_log(WLR_ERROR, "output.first_frame: commit_failed name=%s",
+			output->wlr_output->name);
+		fail_async(output->server);
+		return;
+	}
+	if (!output->first_frame_committed &&
+			output->wlr_output->commit_seq != before) {
+		output->first_frame_committed = true;
+		output->first_frame_commit_seq = output->wlr_output->commit_seq;
+		wlr_log(WLR_INFO,
+			"output.first_frame: committed name=%s renderer=vulkan commit_seq=%u",
+			output->wlr_output->name, output->first_frame_commit_seq);
+	}
 
 	struct timespec now;
 	clock_gettime(CLOCK_MONOTONIC, &now);
 	wlr_scene_output_send_frame_done(scene_output, &now);
+}
+
+static void output_present(struct wl_listener *listener, void *data) {
+	struct tinywl_output *output = wl_container_of(listener, output, present);
+	const struct wlr_output_event_present *event = data;
+	if (!output->first_frame_committed ||
+			event->commit_seq != output->first_frame_commit_seq) {
+		return;
+	}
+	if (!event->presented) {
+		wlr_log(WLR_ERROR,
+			"output.first_frame: discarded name=%s commit_seq=%u",
+			output->wlr_output->name, event->commit_seq);
+		fail_async(output->server);
+		return;
+	}
+	if (event->when == NULL) {
+		wlr_log(WLR_ERROR,
+			"output.first_frame: synthetic_present name=%s commit_seq=%u feedback=unavailable",
+			output->wlr_output->name, event->commit_seq);
+		fail_async(output->server);
+		return;
+	}
+	char refresh[32] = "unknown";
+	if (event->refresh > 0) {
+		snprintf(refresh, sizeof(refresh), "%d", event->refresh);
+	}
+	wlr_log(WLR_INFO,
+		"output.first_frame: presented name=%s mode=%dx%d renderer=vulkan commit_seq=%u feedback=wp_presentation refresh_ns=%s",
+		output->wlr_output->name, output->wlr_output->width,
+		output->wlr_output->height, event->commit_seq, refresh);
+	if (output->server->m2_smoke) {
+		wl_display_terminate(output->server->wl_display);
+	}
 }
 
 static void output_request_state(struct wl_listener *listener, void *data) {
@@ -704,7 +843,11 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	 * when the output window is resized. */
 	struct tinywl_output *output = wl_container_of(listener, output, request_state);
 	const struct wlr_output_event_request_state *event = data;
-	wlr_output_commit_state(output->wlr_output, event->state);
+	if (!wlr_output_commit_state(output->wlr_output, event->state)) {
+		wlr_log(WLR_ERROR, "output.request_state: failed name=%s",
+			output->wlr_output->name);
+		fail_async(output->server);
+	}
 }
 
 static struct wlr_scene_tree *layer_tree_for(
@@ -777,6 +920,7 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	struct tinywl_output *output = wl_container_of(listener, output, destroy);
 
 	wl_list_remove(&output->frame.link);
+	wl_list_remove(&output->present.link);
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
@@ -792,7 +936,11 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 
 	/* Configures the output created by the backend to use our allocator
 	 * and our renderer. Must be done once, before commiting the output */
-	wlr_output_init_render(wlr_output, server->allocator, server->renderer);
+	if (!wlr_output_init_render(wlr_output, server->allocator, server->renderer)) {
+		wlr_log(WLR_ERROR, "output.init_render: failed name=%s", wlr_output->name);
+		fail_async(server);
+		return;
+	}
 
 	/* The output may be disabled, switch it on. */
 	struct wlr_output_state state;
@@ -807,20 +955,37 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	struct wlr_output_mode *mode = wlr_output_preferred_mode(wlr_output);
 	if (mode != NULL) {
 		wlr_output_state_set_mode(&state, mode);
+	} else {
+		wlr_output_state_set_custom_mode(&state, 1280, 720, 0);
 	}
 
 	/* Atomically applies the new output state. */
-	wlr_output_commit_state(wlr_output, &state);
+	bool inject_failure = server->m2_smoke && server->m2_fault != NULL &&
+		strcmp(server->m2_fault, "output-commit") == 0;
+	bool state_committed = !inject_failure &&
+		wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
+	if (!state_committed) {
+		wlr_log(WLR_ERROR, "output.state_commit: failed name=%s", wlr_output->name);
+		fail_async(server);
+		return;
+	}
 
 	/* Allocates and configures our state for this output */
 	struct tinywl_output *output = calloc(1, sizeof(*output));
+	if (output == NULL) {
+		wlr_log(WLR_ERROR, "output.allocate: failed name=%s", wlr_output->name);
+		fail_async(server);
+		return;
+	}
 	output->wlr_output = wlr_output;
 	output->server = server;
 
 	/* Sets up a listener for the frame event. */
 	output->frame.notify = output_frame;
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
+	output->present.notify = output_present;
+	wl_signal_add(&wlr_output->events.present, &output->present);
 
 	/* Sets up a listener for the state request event. */
 	output->request_state.notify = output_request_state;
@@ -843,8 +1008,24 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	 */
 	struct wlr_output_layout_output *l_output = wlr_output_layout_add_auto(server->output_layout,
 		wlr_output);
-	struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
-	wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+	if (l_output == NULL) {
+		wlr_log(WLR_ERROR, "output.layout: failed name=%s", wlr_output->name);
+		fail_async(server);
+		return;
+	}
+	output->scene_output = wlr_scene_output_create(server->scene, wlr_output);
+	if (output->scene_output == NULL) {
+		wlr_output_layout_remove(server->output_layout, wlr_output);
+		wlr_log(WLR_ERROR, "output.scene: failed name=%s", wlr_output->name);
+		fail_async(server);
+		return;
+	}
+	wlr_scene_output_layout_add_output(server->scene_layout, l_output,
+		output->scene_output);
+	wlr_log(WLR_INFO,
+		"output.init: ok name=%s mode=%dx%d requested_refresh=%s",
+		wlr_output->name, wlr_output->width, wlr_output->height,
+		mode == NULL ? "host" : "preferred");
 
 }
 
@@ -1103,34 +1284,85 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
+	bool m2_smoke = false;
+	const char *m2_fault = NULL;
+	static const struct option long_options[] = {
+		{ "m2-smoke", no_argument, NULL, 1000 },
+		{ "m2-fault", required_argument, NULL, 1001 },
+		{ NULL, 0, NULL, 0 },
+	};
 
 	int c;
-	while ((c = getopt(argc, argv, "s:h")) != -1) {
+	while ((c = getopt_long(argc, argv, "s:h", long_options, NULL)) != -1) {
 		switch (c) {
 		case 's':
 			startup_cmd = optarg;
 			break;
+		case 1000:
+			m2_smoke = true;
+			break;
+		case 1001:
+			m2_fault = optarg;
+			break;
 		default:
-			printf("Usage: %s [-s startup command]\n", argv[0]);
-			return 0;
+			fprintf(stderr,
+				"Usage: %s [-s startup command] [--m2-smoke] [--m2-fault=output-commit|scene-commit]\n",
+				argv[0]);
+			return 2;
 		}
 	}
 	if (optind < argc) {
-		printf("Usage: %s [-s startup command]\n", argv[0]);
-		return 0;
+		fprintf(stderr, "Usage: %s [-s startup command] [--m2-smoke]\n", argv[0]);
+		return 2;
+	}
+	if (m2_smoke && startup_cmd != NULL) {
+		wlr_log(WLR_ERROR, "m2.smoke: failed reason=startup-command-not-allowed");
+		return 2;
+	}
+	if (m2_fault != NULL && (!m2_smoke ||
+			(strcmp(m2_fault, "output-commit") != 0 &&
+			strcmp(m2_fault, "scene-commit") != 0))) {
+		wlr_log(WLR_ERROR, "m2.fault: failed reason=invalid-or-non-smoke-hook");
+		return 2;
 	}
 
-	struct tinywl_server server = {0};
+	const char *requested_renderer = getenv("WLR_RENDERER");
+	if (requested_renderer != NULL && strcmp(requested_renderer, "vulkan") != 0) {
+		wlr_log(WLR_ERROR,
+			"renderer policy violation: expected vulkan requested=%s",
+			requested_renderer);
+		return 1;
+	}
+	if (getenv("WLR_RENDERER_ALLOW_SOFTWARE") != NULL) {
+		wlr_log(WLR_ERROR,
+			"renderer.policy: failed reason=WLR_RENDERER_ALLOW_SOFTWARE-forbidden");
+		return 1;
+	}
+	if (setenv("WLR_RENDERER", "vulkan", true) != 0) {
+		wlr_log(WLR_ERROR, "renderer.policy: failed setenv=%s", strerror(errno));
+		return 1;
+	}
+	wlr_log(WLR_INFO, "renderer.policy: ok requested=vulkan");
+
+	struct tinywl_server server = {
+		.m2_smoke = m2_smoke,
+		.m2_fault = m2_fault,
+	};
 	/* The Wayland display is managed by libwayland. It handles accepting
 	 * clients from the Unix socket, manging Wayland globals, and so on. */
 	server.wl_display = wl_display_create();
+	if (server.wl_display == NULL) {
+		wlr_log(WLR_ERROR, "display.create: failed");
+		return 1;
+	}
 	/* The backend is a wlroots feature which abstracts the underlying input and
 	 * output hardware. The autocreate option will choose the most suitable
 	 * backend based on the current environment, such as opening an X11 window
 	 * if an X11 server is running. */
 	server.backend = wlr_backend_autocreate(wl_display_get_event_loop(server.wl_display), NULL);
 	if (server.backend == NULL) {
-		wlr_log(WLR_ERROR, "failed to create wlr_backend");
+		wlr_log(WLR_ERROR, "backend.create: failed");
+		wl_display_destroy(server.wl_display);
 		return 1;
 	}
 
@@ -1140,11 +1372,33 @@ int main(int argc, char *argv[]) {
 	 * supports for shared memory, this configures that for clients. */
 	server.renderer = wlr_renderer_autocreate(server.backend);
 	if (server.renderer == NULL) {
-		wlr_log(WLR_ERROR, "failed to create wlr_renderer");
+		wlr_log(WLR_ERROR, "renderer.create: failed requested=vulkan");
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
 		return 1;
 	}
+	if (!wlr_renderer_is_vk(server.renderer)) {
+		wlr_log(WLR_ERROR, "renderer.create: failed invariant=type-is-not-vulkan");
+		wlr_renderer_destroy(server.renderer);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
+		return 1;
+	}
+	wlr_log(WLR_INFO, "renderer.create: ok type=vulkan");
 
-	wlr_renderer_init_wl_display(server.renderer, server.wl_display);
+	if (!wlr_renderer_init_wl_display(server.renderer, server.wl_display)) {
+		wlr_log(WLR_ERROR, "renderer.wl_display: failed");
+		wlr_renderer_destroy(server.renderer);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
+		return 1;
+	}
+	if (!verify_vulkan_device(server.renderer)) {
+		wlr_renderer_destroy(server.renderer);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
+		return 1;
+	}
 
 	/* Autocreates an allocator for us.
 	 * The allocator is the bridge between the renderer and the backend. It
@@ -1153,9 +1407,13 @@ int main(int argc, char *argv[]) {
 	server.allocator = wlr_allocator_autocreate(server.backend,
 		server.renderer);
 	if (server.allocator == NULL) {
-		wlr_log(WLR_ERROR, "failed to create wlr_allocator");
+		wlr_log(WLR_ERROR, "allocator.create: failed");
+		wlr_renderer_destroy(server.renderer);
+		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
 		return 1;
 	}
+	wlr_log(WLR_INFO, "allocator.create: ok");
 
 	/* This creates some hands-off wlroots interfaces. The compositor is
 	 * necessary for clients to allocate surfaces, the subcompositor allows to
@@ -1269,21 +1527,41 @@ int main(int argc, char *argv[]) {
 	/* Add a Unix socket to the Wayland display. */
 	const char *socket = wl_display_add_socket_auto(server.wl_display);
 	if (!socket) {
+		wlr_log(WLR_ERROR, "display.socket: failed");
+		wlr_scene_node_destroy(&server.scene->tree.node);
+		wlr_xcursor_manager_destroy(server.cursor_mgr);
+		wlr_cursor_destroy(server.cursor);
+		wlr_allocator_destroy(server.allocator);
+		wlr_renderer_destroy(server.renderer);
 		wlr_backend_destroy(server.backend);
+		wl_display_destroy(server.wl_display);
 		return 1;
 	}
 
 	/* Start the backend. This will enumerate outputs and inputs, become the DRM
 	 * master, etc */
 	if (!wlr_backend_start(server.backend)) {
+		wlr_log(WLR_ERROR, "backend.start: failed");
+		wlr_scene_node_destroy(&server.scene->tree.node);
+		wlr_xcursor_manager_destroy(server.cursor_mgr);
+		wlr_cursor_destroy(server.cursor);
+		wlr_allocator_destroy(server.allocator);
+		wlr_renderer_destroy(server.renderer);
 		wlr_backend_destroy(server.backend);
 		wl_display_destroy(server.wl_display);
 		return 1;
 	}
+	if (server.exit_status != 0) {
+		goto shutdown;
+	}
 
 	/* Set the WAYLAND_DISPLAY environment variable to our socket and run the
 	 * startup command if requested. */
-	setenv("WAYLAND_DISPLAY", socket, true);
+	if (setenv("WAYLAND_DISPLAY", socket, true) != 0) {
+		wlr_log(WLR_ERROR, "display.environment: failed setenv=%s", strerror(errno));
+		server.exit_status = 1;
+		goto shutdown;
+	}
 	if (startup_cmd) {
 		if (fork() == 0) {
 			execl("/bin/sh", "/bin/sh", "-c", startup_cmd, (void *)NULL);
@@ -1299,6 +1577,7 @@ int main(int argc, char *argv[]) {
 
 	/* Once wl_display_run returns, we destroy all clients then shut down the
 	 * server. */
+shutdown:
 	wl_display_destroy_clients(server.wl_display);
 	wlr_scene_node_destroy(&server.scene->tree.node);
 	wlr_xcursor_manager_destroy(server.cursor_mgr);
@@ -1307,5 +1586,5 @@ int main(int argc, char *argv[]) {
 	wlr_renderer_destroy(server.renderer);
 	wlr_backend_destroy(server.backend);
 	wl_display_destroy(server.wl_display);
-	return 0;
+	return server.exit_status;
 }

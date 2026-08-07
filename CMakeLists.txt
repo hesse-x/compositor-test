@@ -18,6 +18,8 @@ set(WLROOTS_LIB   ${WLROOTS_BUILD}/libwlroots-0.18.so)
 
 find_program(MESON_EXECUTABLE  meson  REQUIRED)
 find_program(NINJA_EXECUTABLE  ninja  REQUIRED)
+find_program(PYTHON3_EXECUTABLE python3 REQUIRED)
+find_package(Vulkan 1.2.182 REQUIRED)
 
 # Options passed to `meson setup` for wlroots.
 # examples/tests are disabled because we compile tinywl.c ourselves.
@@ -26,13 +28,8 @@ find_program(NINJA_EXECUTABLE  ninja  REQUIRED)
 # wayland 后端默认无条件编入（backend/meson.build 里 subdir('wayland')），
 # 不受 backends 选项控制，所以嵌套到 Wayland 会话也支持。
 # gbm allocator 保留（嵌套后端靠它分配 buffer）；libgbm 走 vendor 的 gbm.pc。
-set(WLROOTS_MESON_OPTIONS
-	-Dexamples=false
-	-Dxwayland=disabled
-	-Dbackends=x11
-	CACHE STRING "Extra options for wlroots meson setup")
-
-# Configure wlroots (runs once; delete the wlroots build dir to reconfigure).
+# Configure wlroots before every build so changed options cannot be hidden by
+# Meson's existing cache. The helper also verifies the effective renderer list.
 # 系统 wayland 1.22 < wlroots 0.18 要求的 1.23：把 wayland 1.23 源码放进
 # wlroots 源码树的 subprojects/wayland（git submodule），meson 的 fallback
 # 机制会自动发现并把它作为子项目源码编译，不碰系统包。
@@ -41,26 +38,26 @@ set(WLROOTS_MESON_OPTIONS
 # vendor 的 gbm.h + 一个 gbm.pc 指向系统 libgbm.so.1，让 wlroots 的
 # dependency('gbm') 满足。通过 PKG_CONFIG_PATH 暴露给 meson。
 set(GBM_PC_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/gbm)
-add_custom_command(
-	OUTPUT ${WLROOTS_BUILD}/build.ninja
+set(WLROOTS_CONFIGURE_HELPER ${CMAKE_CURRENT_SOURCE_DIR}/tools/configure-wlroots.sh)
+add_custom_target(wlroots_configure
 	COMMAND ${CMAKE_COMMAND} -E env
 	        PKG_CONFIG_PATH=${GBM_PC_DIR}
-	        ${MESON_EXECUTABLE} setup ${WLROOTS_BUILD} ${WLROOTS_SRC}
-	        ${WLROOTS_MESON_OPTIONS}
+	        ${WLROOTS_CONFIGURE_HELPER} ${WLROOTS_SRC} ${WLROOTS_BUILD}
+	BYPRODUCTS ${WLROOTS_BUILD}/build.ninja
+	DEPENDS ${WLROOTS_CONFIGURE_HELPER}
+	        ${CMAKE_CURRENT_SOURCE_DIR}/wlroots-meson-options.txt
 	COMMENT "Configuring wlroots with Meson"
 	VERBATIM
 )
 
-# Build wlroots.
-add_custom_command(
-	OUTPUT ${WLROOTS_LIB}
+# Build wlroots after the mandatory reconfiguration.
+add_custom_target(wlroots_build ALL
 	COMMAND ${NINJA_EXECUTABLE} -C ${WLROOTS_BUILD}
-	DEPENDS ${WLROOTS_BUILD}/build.ninja
+	BYPRODUCTS ${WLROOTS_LIB}
 	COMMENT "Building wlroots"
 	VERBATIM
 )
-
-add_custom_target(wlroots_build ALL DEPENDS ${WLROOTS_LIB})
+add_dependencies(wlroots_build wlroots_configure)
 
 # Expose the built library as an imported target.
 # Meson generates version.h/config.h and the *-protocol.h headers into the
@@ -116,6 +113,7 @@ target_link_libraries(tinywl PRIVATE
 	PkgConfig::WAYLAND_SERVER
 	PkgConfig::XKBCOMMON
 	PkgConfig::PIXMAN
+	Vulkan::Vulkan
 	png_shared
 )
 # 让 tinywl 在构建目录里直接运行时能找到 libwlroots-0.18.so 和 libpng16.so

@@ -13,6 +13,7 @@ BUILD_DIR=build
 # wlroots 子项目或 vendor 的 .pc，全都不碰系统包。
 APT_PACKAGES=(
 	build-essential cmake meson ninja-build pkg-config
+	python3 libvulkan-dev glslang-tools vulkan-tools
 	libwayland-dev wayland-protocols
 	libegl-dev libgles2-mesa-dev
 	libxkbcommon-dev libpixman-1-dev
@@ -32,9 +33,15 @@ if ((${#missing[@]})); then
 	printf '  %s\n' "${missing[@]}" >&2
 	echo >&2
 	echo "请先安装:  sudo apt-get install ${missing[*]}" >&2
-	echo "注意: 安装新依赖后需删掉 wlroots 的构建缓存再编译（meson 会缓存依赖探测结果）:" >&2
-	echo "          rm -rf $BUILD_DIR/wlroots" >&2
 	exit 1
+fi
+
+if ! vulkaninfo --summary >/dev/null 2>&1; then
+	echo "错误: vulkaninfo 无法枚举 Vulkan 设备。" >&2
+	exit 1
+fi
+if ! vulkaninfo --summary 2>/dev/null | grep -q 'VK_LAYER_KHRONOS_validation'; then
+	echo "提示: 未发现 VK_LAYER_KHRONOS_validation；M2 validation 验收需要 vulkan-validationlayers。" >&2
 fi
 
 # --- 构建 -----------------------------------------------------------------
@@ -42,12 +49,9 @@ fi
 # 需要链接 wayland 1.23（wlroots 0.18 用了 wl_shm v2，系统只有 1.22），
 # 先把 wlroots 编出来才能拿到 wayland 的 .pc 给后续 CMake 用。
 WLROOTS_BUILD=$BUILD_DIR/wlroots
-if [[ ! -f $WLROOTS_BUILD/build.ninja ]]; then
-	echo ">> 配置 wlroots (Meson)"
-	cmake -E env PKG_CONFIG_PATH=$PWD/third_party/gbm \
-		meson setup "$WLROOTS_BUILD" third_party/wlroots \
-		-Dexamples=false -Dxwayland=disabled -Dbackends=x11
-fi
+echo ">> 配置 wlroots (Meson)"
+cmake -E env PKG_CONFIG_PATH=$PWD/third_party/gbm \
+	tools/configure-wlroots.sh third_party/wlroots "$WLROOTS_BUILD"
 echo ">> 编译 wlroots"
 ninja -C "$WLROOTS_BUILD"
 

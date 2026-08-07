@@ -8,6 +8,26 @@ cd "$(dirname "$0")"
 
 TINYWL=build/tinywl
 
+if [[ ${WLR_RENDERER:-vulkan} != vulkan ]]; then
+	echo "错误: renderer policy violation: expected vulkan" >&2
+	exit 1
+fi
+export WLR_RENDERER=vulkan
+if [[ -z ${WLR_BACKENDS:-} ]]; then
+	if [[ -n ${WAYLAND_DISPLAY:-} ]]; then
+		export WLR_BACKENDS=wayland
+	elif [[ -n ${DISPLAY:-} ]]; then
+		export WLR_BACKENDS=x11
+	else
+		echo "错误: 当前构建仅支持 Wayland/X11 嵌套后端。" >&2
+		exit 1
+	fi
+fi
+export VK_LOADER_DEBUG=${VK_LOADER_DEBUG:-error,warn}
+if [[ ${TINYWL_VALIDATION:-0} == 1 ]]; then
+	export VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+fi
+
 if [[ ! -x $TINYWL ]]; then
 	echo ">> tinywl 还没编译，先构建"
 	./build.sh
